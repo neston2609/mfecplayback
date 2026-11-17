@@ -1,0 +1,17 @@
+export const MOCK_CONVERSATIONS = [
+  { conversationId: 'demo-ava-agent-001', conversationStart: '2026-11-16T03:15:21.000Z', conversationEnd: '2026-11-16T03:22:54.000Z', originatingDirection: 'inbound', externalTag: 'QA-DEMO-01', participants: [
+    { participantId: 'p-c1', purpose: 'customer', participantName: 'Customer', sessions: [{ ani: '+6621000101', dnis: '+6620000000', mediaType: 'voice', segments: [{ segmentStart: '2026-11-16T03:15:21.000Z', segmentEnd: '2026-11-16T03:22:54.000Z', segmentType: 'interact' }] }] },
+    { participantId: 'p-f1', purpose: 'ivr', participantName: 'AVA Virtual Assistant', sessions: [{ mediaType: 'voice', flowId: 'flow-ava-01', flowName: 'AVA Service Assistant', segments: [{ segmentStart: '2026-11-16T03:15:23.000Z', segmentEnd: '2026-11-16T03:17:14.000Z', segmentType: 'interact' }] }] },
+    { participantId: 'p-a1', purpose: 'agent', participantName: 'Nicha S.', userId: 'agent-101', sessions: [{ mediaType: 'voice', queueId: 'queue-care', queueName: 'Customer Care', segments: [{ segmentStart: '2026-11-16T03:18:02.000Z', segmentEnd: '2026-11-16T03:22:40.000Z', segmentType: 'interact', wrapUpCode: 'Resolved' }] }] },
+  ] },
+  { conversationId: 'demo-bot-only-002', conversationStart: '2026-11-16T05:41:02.000Z', conversationEnd: '2026-11-16T05:43:34.000Z', originatingDirection: 'inbound', externalTag: 'QA-DEMO-02', participants: [
+    { participantId: 'p-c2', purpose: 'customer', participantName: 'Customer', sessions: [{ ani: '+6621000102', dnis: '+6620000000', mediaType: 'voice', segments: [{ segmentStart: '2026-11-16T05:41:02.000Z', segmentEnd: '2026-11-16T05:43:34.000Z', segmentType: 'interact' }] }] },
+    { participantId: 'p-f2', purpose: 'ivr', participantName: 'Billing IVR', sessions: [{ mediaType: 'voice', flowId: 'flow-billing', flowName: 'Billing Self Service', segments: [{ segmentStart: '2026-11-16T05:41:05.000Z', segmentEnd: '2026-11-16T05:43:30.000Z', segmentType: 'interact' }] }] },
+  ] },
+  { conversationId: 'demo-transfer-003', conversationStart: '2026-11-15T08:22:00.000Z', conversationEnd: '2026-11-15T08:37:13.000Z', originatingDirection: 'outbound', participants: [
+    { participantId: 'p-c3', purpose: 'customer', participantName: 'Customer', sessions: [{ ani: '+6621000103', dnis: '+6622001234', mediaType: 'voice', segments: [{ segmentStart: '2026-11-15T08:22:00.000Z', segmentEnd: '2026-11-15T08:37:13.000Z', segmentType: 'interact' }] }] },
+    { participantId: 'p-a2', purpose: 'agent', participantName: 'Krit P.', userId: 'agent-203', sessions: [{ mediaType: 'voice', queueId: 'queue-sales', queueName: 'Sales', segments: [{ segmentStart: '2026-11-15T08:22:09.000Z', segmentEnd: '2026-11-15T08:28:00.000Z', segmentType: 'interact', wrapUpCode: 'Transfer' }] }] },
+    { participantId: 'p-a3', purpose: 'agent', participantName: 'Pim R.', userId: 'agent-187', sessions: [{ mediaType: 'voice', queueId: 'queue-retention', queueName: 'Retention', segments: [{ segmentStart: '2026-11-15T08:29:11.000Z', segmentEnd: '2026-11-15T08:36:42.000Z', segmentType: 'interact', wrapUpCode: 'Resolved' }] }] },
+  ] },
+];
+export const MOCK_RECORDINGS: Record<string, unknown[]> = Object.fromEntries(MOCK_CONVERSATIONS.map((c, index) => [c.conversationId, [{ id: `demo-recording-${index + 1}`, conversationId: c.conversationId, startTime: c.conversationStart, endTime: c.conversationEnd, media: 'audio', mediaType: 'audio', status: 'AVAILABLE', durationMs: new Date(c.conversationEnd).getTime() - new Date(c.conversationStart).getTime() }]]));

@@ -1,0 +1,12 @@
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('administrator','supervisor','quality_analyst','viewer')), enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, name TEXT NOT NULL, organization_label TEXT NOT NULL, region_id TEXT NOT NULL, api_base_url TEXT NOT NULL, oauth_base_url TEXT NOT NULL, client_id TEXT NOT NULL, client_secret_enc TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS user_connection_access (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE, PRIMARY KEY(user_id,connection_id));
+CREATE TABLE IF NOT EXISTS bot_flow_registry (id TEXT PRIMARY KEY, connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE, flow_id TEXT, flow_name TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'voice_bot');
+CREATE TABLE IF NOT EXISTS saved_searches (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, filters_json TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS search_preferences (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, preferences_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS customer_field_mappings (id TEXT PRIMARY KEY, connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE, field_name TEXT NOT NULL, source_type TEXT NOT NULL, source_key TEXT NOT NULL, sensitive INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS conversation_metadata_index (connection_id TEXT NOT NULL, conversation_id TEXT NOT NULL, indexed_at TEXT NOT NULL, expires_at TEXT NOT NULL, metadata_json TEXT NOT NULL, PRIMARY KEY(connection_id,conversation_id));
+CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, username TEXT NOT NULL, action TEXT NOT NULL, result TEXT NOT NULL, connection_id TEXT, conversation_id TEXT, recording_id TEXT, source_ip TEXT, detail_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_logs(created_at DESC);
+CREATE TABLE IF NOT EXISTS application_settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL);

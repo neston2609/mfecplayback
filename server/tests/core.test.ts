@@ -1,0 +1,49 @@
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { REGIONS, trustedBaseUrl } from '../regions.js';
+import { encrypt, decrypt } from '../security.js';
+import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
+
+describe('MFEC Recording Explorer security and synthetic fixtures', () => {
+  beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
+  afterAll(() => { delete process.env.MASTER_ENCRYPTION_KEY; });
+
+  it('provides official common Genesys regions including Singapore and Tokyo', () => {
+    expect(REGIONS.find(region => region.id === 'ap-southeast-1')?.api).toBe('https://api.mypurecloud.com.sg');
+    expect(REGIONS.find(region => region.id === 'ap-northeast-1')?.oauth).toBe('https://login.mypurecloud.jp');
+    expect(REGIONS.some(region => region.id === 'us-east-1')).toBe(true);
+    expect(REGIONS.some(region => region.id === 'us-west-2')).toBe(true);
+    expect(REGIONS.some(region => region.id === 'eu-west-1')).toBe(true);
+  });
+
+  it('rejects endpoint URLs outside exact allowlisted host origins', () => {
+    expect(trustedBaseUrl('https://api.mypurecloud.com.sg', 'api')).toBe('https://api.mypurecloud.com.sg');
+    expect(() => trustedBaseUrl('https://api.mypurecloud.com.sg.attacker.test', 'api')).toThrow();
+    expect(() => trustedBaseUrl('http://127.0.0.1', 'api')).toThrow();
+    expect(() => trustedBaseUrl('https://api.mypurecloud.com.sg/path', 'api')).toThrow();
+  });
+
+  it('encrypts secrets with authenticated encryption and decrypts them', () => {
+    const stored = encrypt('synthetic-client-secret');
+    expect(stored).not.toContain('synthetic-client-secret');
+    expect(decrypt(stored)).toBe('synthetic-client-secret');
+    expect(() => decrypt(stored.replace(/.$/, 'A'))).toThrow();
+  });
+
+  it('includes synthetic bot-only, bot-to-agent, multi-agent and multi-recording cases', () => {
+    const byId = new Map(MOCK_CONVERSATIONS.map(item => [item.conversationId, item]));
+    expect(byId.get('demo-bot-only-002')?.participants.some((p:any) => p.purpose === 'ivr')).toBe(true);
+    const transferred = byId.get('demo-ava-agent-001')!;
+    expect(transferred.participants.some((p:any) => p.purpose === 'agent')).toBe(true);
+    const multiAgent = byId.get('demo-transfer-003')!;
+    expect(multiAgent.participants.filter((p:any) => p.purpose === 'agent')).toHaveLength(2);
+    expect(Object.values(MOCK_RECORDINGS).some(records => records.length > 0)).toBe(true);
+  });
+
+  it('uses valid ISO timestamps in synthetic calls for timezone-safe UTC queries', () => {
+    for (const conversation of MOCK_CONVERSATIONS) {
+      expect(Number.isFinite(Date.parse(conversation.conversationStart))).toBe(true);
+      expect(Number.isFinite(Date.parse(conversation.conversationEnd))).toBe(true);
+      expect(Date.parse(conversation.conversationEnd)).toBeGreaterThan(Date.parse(conversation.conversationStart));
+    }
+  });
+});
