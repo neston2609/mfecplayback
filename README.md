@@ -108,7 +108,7 @@ WorkingDirectory=/opt/mfec-recording-explorer
 EnvironmentFile=/etc/mfec-recording-explorer.env
 Environment=DATABASE_PATH=/var/lib/mfec-recording-explorer/app.sqlite
 Environment=HOST=127.0.0.1
-ExecStart=/usr/bin/node /opt/mfec-recording-explorer/dist-server/index.js
+ExecStart=/usr/bin/node /opt/mfec-recording-explorer/dist-server/server/index.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

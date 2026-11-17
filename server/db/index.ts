@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const databasePath = path.resolve(process.env.DATABASE_PATH || './runtime/recording-explorer.sqlite');
+const databasePath = path.resolve(process.env.DATABASE_PATH || (process.env.NODE_ENV === 'production' ? './runtime/recording-explorer.sqlite' : './runtime/recording-explorer.sqlite'));
 fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 export const db = new Database(databasePath);
 db.pragma('journal_mode = WAL');
