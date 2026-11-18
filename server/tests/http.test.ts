@@ -88,6 +88,12 @@ describe('HTTP API security and Mock Mode flows', () => {
     const auth = await login.json() as { csrfToken: string };
     csrf = auth.csrfToken;
 
+    const mockConnections = await request('/api/genesys/connections');
+    expect(mockConnections.status).toBe(200);
+    const listedConnections = await mockConnections.json() as { connections: { id: string; mock?: boolean }[] };
+    expect(listedConnections.connections).toHaveLength(1);
+    expect(listedConnections.connections[0]).toMatchObject({ id: 'mock', mock: true });
+
     const noCsrf = await request('/api/recordings/search', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     expect(noCsrf.status).toBe(403);
     const crossOrigin = await request('/api/genesys/connections', { headers: { Origin: 'https://attacker.example' } });
@@ -113,6 +119,72 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(result.results).toHaveLength(3);
     expect(result.results.every(row => row.recordingCount === 1)).toBe(true);
   });
+
+  it('lists saved live connections after trusted-region validation without exposing endpoint or secret fields', async () => {
+    const liveDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'mfec-recording-explorer-live-test-'));
+    const port = await freePort();
+    const liveUrl = `http://127.0.0.1:${port}`;
+    let liveChild: ChildProcess | undefined;
+    let liveOutput = '';
+    let liveCookie = '';
+    let liveCsrf = '';
+    try {
+      liveChild = spawn(process.execPath, ['--import', 'tsx', 'server/index.ts'], {
+        cwd: root,
+        env: {
+          ...process.env,
+          NODE_ENV: 'test', PORT: String(port), HOST: '127.0.0.1',
+          APP_ORIGIN: 'http://localhost:5173', TRUST_PROXY: 'false', MOCK_MODE: 'false',
+          SESSION_SECRET: 'live-integration-test-session-secret-with-sufficient-entropy',
+          MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 23).toString('base64'),
+          DATABASE_PATH: path.join(liveDirectory, 'integration.sqlite'),
+          INITIAL_ADMIN_USERNAME: 'live-integration-admin', INITIAL_ADMIN_PASSWORD: 'Live-Integration-Password-456!',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      liveChild.stdout?.on('data', data => { liveOutput += String(data); });
+      liveChild.stderr?.on('data', data => { liveOutput += String(data); });
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        if (liveChild.exitCode !== null && liveChild.exitCode !== undefined) throw new Error(`Live API test server exited (${liveChild.exitCode}).\n${liveOutput}`);
+        try { if ((await fetch(`${liveUrl}/api/health`)).ok) break; } catch { /* Wait for the local test server to start. */ }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      const login = await fetch(`${liveUrl}/api/auth/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: 'live-integration-admin', password: 'Live-Integration-Password-456!' }),
+      });
+      expect(login.status).toBe(200);
+      liveCookie = (login.headers.get('set-cookie') || '').split(';', 1)[0];
+      liveCsrf = (await login.json() as { csrfToken: string }).csrfToken;
+
+      const create = await fetch(`${liveUrl}/api/genesys/connections`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: liveCookie, 'x-csrf-token': liveCsrf, Origin: 'http://localhost:5173' },
+        body: JSON.stringify({
+          name: 'Saved integration organization', organizationLabel: 'Integration', regionId: 'ap-southeast-1',
+          clientId: 'integration-client-id', clientSecret: 'integration-secret-that-must-not-leak', enabled: true, isDefault: true,
+        }),
+      });
+      expect(create.status).toBe(201);
+
+      const list = await fetch(`${liveUrl}/api/genesys/connections`, { headers: { cookie: liveCookie } });
+      expect(list.status).toBe(200);
+      const body = await list.json() as { connections: Record<string, unknown>[] };
+      expect(body.connections).toHaveLength(1);
+      expect(body.connections[0]).toMatchObject({ name: 'Saved integration organization', region_id: 'ap-southeast-1', enabled: 1, is_default: 1, secret_configured: 1 });
+      expect(body.connections[0]).not.toHaveProperty('api_base_url');
+      expect(body.connections[0]).not.toHaveProperty('oauth_base_url');
+      expect(body.connections[0]).not.toHaveProperty('client_secret_enc');
+      expect(JSON.stringify(body)).not.toContain('integration-secret-that-must-not-leak');
+    } finally {
+      if (liveChild && liveChild.exitCode === null) {
+        await fetch(`${liveUrl}/__test/shutdown`, { method: 'POST' }).catch(() => undefined);
+        await new Promise<void>(resolve => liveChild?.once('exit', () => resolve()));
+      }
+      await fs.rm(liveDirectory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('limits the analytics interval and labels synthetic metadata as non-playable', async () => {
     const tooWide = await request('/api/recordings/search', {

@@ -97,10 +97,12 @@ app.post('/api/auth/password', requireAuth, requireCsrf, async (req, res, next) 
 app.get('/api/genesys/regions', requireAuth, (_req, res) => res.json({ regions: REGIONS }));
 app.get('/api/genesys/connections', requireAuth, (req, res) => {
   const rows = req.session.user!.role === 'administrator'
-    ? (process.env.MOCK_MODE === 'true' ? [] : db.prepare("SELECT id,name,organization_label,region_id,enabled,is_default,last_success_at,CASE WHEN last_error IS NULL THEN NULL ELSE 'Connection check failed. Review administrator logs.' END AS last_error,client_id,CASE WHEN client_secret_enc='' THEN 0 ELSE 1 END AS secret_configured FROM connections ORDER BY name").all())
-    : (process.env.MOCK_MODE === 'true' ? [] : db.prepare('SELECT c.id,c.name,c.organization_label,c.region_id,c.enabled,c.is_default,c.last_success_at,c.last_error,c.client_id,1 AS secret_configured FROM connections c JOIN user_connection_access a ON a.connection_id=c.id WHERE a.user_id=? AND c.enabled=1 ORDER BY c.name').all(req.session.user!.id));
+    ? (process.env.MOCK_MODE === 'true' ? [] : db.prepare("SELECT id,name,organization_label,region_id,api_base_url,oauth_base_url,enabled,is_default,last_success_at,CASE WHEN last_error IS NULL THEN NULL ELSE 'Connection check failed. Review administrator logs.' END AS last_error,client_id,CASE WHEN client_secret_enc='' THEN 0 ELSE 1 END AS secret_configured FROM connections ORDER BY name").all())
+    : (process.env.MOCK_MODE === 'true' ? [] : db.prepare('SELECT c.id,c.name,c.organization_label,c.region_id,c.api_base_url,c.oauth_base_url,c.enabled,c.is_default,c.last_success_at,c.last_error,c.client_id,1 AS secret_configured FROM connections c JOIN user_connection_access a ON a.connection_id=c.id WHERE a.user_id=? AND c.enabled=1 ORDER BY c.name').all(req.session.user!.id));
   const values = process.env.MOCK_MODE === 'true' ? [{ id: 'mock', name: 'Synthetic Demo Organization', organization_label: 'Mock Mode · Synthetic data', region_id: 'ap-southeast-1', enabled: 1, is_default: 1, last_success_at: null, last_error: null, client_id: '', secret_configured: 0, mock: true }] : [];
-  const validRows=(rows as any[]).filter(connection=>REGIONS.some(region=>region.id===connection.region_id&&region.api===connection.api_base_url&&region.oauth===connection.oauth_base_url));
+  const validRows=(rows as any[])
+    .filter(connection=>REGIONS.some(region=>region.id===connection.region_id&&region.api===connection.api_base_url&&region.oauth===connection.oauth_base_url))
+    .map(({api_base_url,oauth_base_url,...connection})=>connection);
   res.json({ connections: [...values, ...validRows] });
 });
 app.post('/api/genesys/connections', requireAuth, requireAdmin, requireCsrf, (req, res, next) => {
