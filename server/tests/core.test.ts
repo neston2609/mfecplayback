@@ -3,6 +3,7 @@ import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../reg
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
+import { getRecordingMedia, isMessageRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
@@ -92,6 +93,51 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
       if (originalMode === undefined) delete process.env.MOCK_MODE;
       else process.env.MOCK_MODE = originalMode;
     }
+  });
+
+  it('requests downloadable Genesys recording media and waits for asynchronous readiness', async () => {
+    const path = recordingMediaRequestPath('conversation id', 'recording/id');
+    expect(path).toBe('/api/v2/conversations/conversation%20id/recordings/recording%2Fid?formatId=WEBM&download=true');
+    const requested: string[] = [];
+    const client = { async get<T>(endpoint: string): Promise<T> {
+      requested.push(endpoint);
+      return (requested.length < 3 ? undefined : { mediaUris: { S: { mediaUri: 'https://prod-recording-playback.s3.amazonaws.com/audio?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig' } } }) as T;
+    } };
+    const result = await getRecordingMedia(client, 'conversation', 'recording', async () => undefined);
+    expect(requested).toHaveLength(3);
+    expect(requested.every(endpoint => endpoint.includes('download=true'))).toBe(true);
+    expect(result?.mediaUri).toContain('X-Amz-Signature=sig');
+    let attempts = 0;
+    const unavailableClient = { async get<T>(): Promise<T> { attempts++; return undefined as T; } };
+    expect(await getRecordingMedia(unavailableClient, 'conversation', 'pending', async () => undefined)).toBeUndefined();
+    expect(attempts).toBe(8);
+  });
+
+  it('allows only signed Genesys recording storage URLs and known regional media hosts', () => {
+    const connection = {
+      id: 'media-url-test', name: 'Test', organization_label: 'Test', region_id: 'ap-southeast-1',
+      api_base_url: 'https://api.apse1.pure.cloud', oauth_base_url: 'https://login.apse1.pure.cloud',
+      client_id: 'client', client_secret_enc: 'encrypted', enabled: 1, is_default: 0,
+    };
+    expect(validateRecordingMediaUrl('https://api-downloads.apse1.pure.cloud/audio', connection).hostname).toBe('api-downloads.apse1.pure.cloud');
+    expect(validateRecordingMediaUrl('https://dhqbrvplips7x.cloudfront.net/audio?Policy=p&Signature=s&Key-Pair-Id=k', connection).hostname).toBe('dhqbrvplips7x.cloudfront.net');
+    expect(() => validateRecordingMediaUrl('https://d123abc.cloudfront.net/audio?Policy=p&Signature=s&Key-Pair-Id=k', connection)).toThrow(/untrusted/i);
+    expect(() => validateRecordingMediaUrl('https://d123abc.cloudfront.net/audio?Expires=123&Signature=s&Key-Pair-Id=k', connection)).toThrow(/untrusted/i);
+    expect(validateRecordingMediaUrl('https://prod-recording-playback.s3.amazonaws.com/audio?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig', connection).hostname).toBe('prod-recording-playback.s3.amazonaws.com');
+    expect(() => validateRecordingMediaUrl('https://attacker.example/audio?X-Amz-Signature=sig', connection)).toThrow(/untrusted/i);
+    expect(() => validateRecordingMediaUrl('https://attacker-bucket.s3.amazonaws.com/audio?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig', connection)).toThrow(/untrusted/i);
+    expect(() => validateRecordingMediaUrl('https://d123abc.cloudfront.net/audio?X-Amz-Signature=sig', connection)).toThrow(/untrusted/i);
+    expect(() => validateRecordingMediaUrl('https://prod-recording-playback.s3.amazonaws.com/audio', connection)).toThrow(/untrusted/i);
+    expect(() => validateRecordingMediaUrl('http://api-downloads.apse1.pure.cloud/audio', connection)).toThrow(/untrusted/i);
+  });
+
+  it('distinguishes message recording archives from playable media', () => {
+    expect(isZipMediaContentType('application/zip')).toBe(true);
+    expect(isZipMediaContentType('application/x-zip-compressed; charset=binary')).toBe(true);
+    expect(isZipMediaContentType('audio/webm')).toBe(false);
+    expect(isZipMediaContentType('application/octet-stream')).toBe(false);
+    expect(isMessageRecording({ media: 'message' })).toBe(true);
+    expect(isMessageRecording({ media: 'voice' })).toBe(false);
   });
 
 });

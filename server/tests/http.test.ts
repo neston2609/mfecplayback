@@ -117,7 +117,22 @@ describe('HTTP API security and Mock Mode flows', () => {
     const result = await search.json() as { mock: boolean; results: { conversationId: string; recordingCount: number }[] };
     expect(result.mock).toBe(true);
     expect(result.results).toHaveLength(3);
-    expect(result.results.every(row => row.recordingCount === 1)).toBe(true);
+    expect(result.results.every(row => row.recordingCount > 0)).toBe(true);
+
+    const defaultRecordingOnly = await request('/api/recordings/search', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-11-14T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', pageNumber: 1, pageSize: 25 }),
+    }, true);
+    expect((await defaultRecordingOnly.json() as { results: unknown[] }).results).toHaveLength(3);
+
+    const missingRecording = await request('/api/recordings/search', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-11-14T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', includeNoRecording: true, pageNumber: 1, pageSize: 50 }),
+    }, true);
+    expect(missingRecording.status).toBe(200);
+    const allConversations = await missingRecording.json() as { results: { recordingCount: number }[]; pageSize: number };
+    expect(allConversations.results).toHaveLength(4);
+    expect(allConversations.results.some(row => row.recordingCount === 0)).toBe(true);
   });
 
   it('lists saved live connections after trusted-region validation without exposing endpoint or secret fields', async () => {
@@ -223,6 +238,43 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(removeAdded.status).toBe(200);
   });
 
+  it('stores UI appearance per user and restricts the shared default to administrators', async () => {
+    const initial = await request('/api/user/appearance');
+    expect(initial.status).toBe(200);
+    expect((await initial.json() as { appearance: unknown; userOverride: boolean; canSetDefault: boolean })).toMatchObject({
+      appearance: { theme: 'light', fontFamily: 'Prompt', fontSize: 13 }, userOverride: false, canSetDefault: true,
+    });
+
+    const invalidSize = await request('/api/user/appearance', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'user', appearance: { theme: 'dark', fontFamily: 'Prompt', fontSize: 25 } }),
+    }, true);
+    expect(invalidSize.status).toBe(400);
+
+    const personal = await request('/api/user/appearance', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'user', appearance: { theme: 'dark', fontFamily: 'Century Gothic', fontSize: 24 } }),
+    }, true);
+    expect(personal.status).toBe(200);
+    expect((await personal.json() as { appearance: unknown; userOverride: boolean }).appearance).toEqual({ theme: 'dark', fontFamily: 'Century Gothic', fontSize: 24 });
+
+    const sharedDefault = await request('/api/user/appearance', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'default', appearance: { theme: 'light', fontFamily: 'Prompt', fontSize: 15 } }),
+    }, true);
+    expect(sharedDefault.status).toBe(200);
+    expect(await sharedDefault.json()).toMatchObject({
+      appearance: { theme: 'dark', fontFamily: 'Century Gothic', fontSize: 24 },
+      userOverride: true,
+      defaultAppearance: { theme: 'light', fontFamily: 'Prompt', fontSize: 15 },
+    });
+    const clearPersonal = await request('/api/user/appearance', { method: 'DELETE' }, true);
+    expect(clearPersonal.status).toBe(200);
+    expect(await clearPersonal.json()).toMatchObject({
+      appearance: { theme: 'light', fontFamily: 'Prompt', fontSize: 15 }, userOverride: false,
+    });
+  });
+
   it('limits the analytics interval and labels synthetic metadata as non-playable', async () => {
     const tooWide = await request('/api/recordings/search', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -235,6 +287,20 @@ describe('HTTP API security and Mock Mode flows', () => {
     const audit = await request('/api/audit');
     expect(audit.status).toBe(200);
     expect((await audit.json() as { logs: unknown[] }).logs.length).toBeGreaterThan(0);
+  });
+
+  it('filters and paginates audit events and persists the retention window', async () => {
+    const defaultAudit = await request('/api/audit');
+    expect(defaultAudit.status).toBe(200);
+    expect(await defaultAudit.json()).toMatchObject({ page: 1, pageSize: 25, totalPages: 1 });
+    const filteredAudit = await request('/api/audit?action=SEARCH&pageSize=50');
+    expect(filteredAudit.status).toBe(200);
+    expect((await filteredAudit.json() as { logs: { action: string }[]; pageSize: number }).logs.every(row => row.action === 'SEARCH')).toBe(true);
+    const retention = await request('/api/admin/audit-retention');
+    expect(await retention.json()).toMatchObject({ days: 35, defaultDays: 35 });
+    const update = await request('/api/admin/audit-retention', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ days: 60 }) }, true);
+    expect(update.status).toBe(200);
+    expect(await update.json()).toMatchObject({ days: 60 });
   });
 
   it('restricts administration, preserves a final administrator, and revokes disabled-user sessions', async () => {
@@ -265,6 +331,12 @@ describe('HTTP API security and Mock Mode flows', () => {
       body: JSON.stringify({ regions: [] }),
     });
     expect(viewerRegionUpdate.status).toBe(403);
+    const viewerDefaultAppearance = await fetch(`${baseUrl}/api/user/appearance`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', Cookie: viewerCookie, 'x-csrf-token': viewerAuth.csrfToken, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({ scope: 'default', appearance: { theme: 'dark', fontFamily: 'Prompt', fontSize: 14 } }),
+    });
+    expect(viewerDefaultAppearance.status).toBe(403);
 
     const disable = await request(`/api/admin/users/${created.id}/enabled`, {
       method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: false }),
@@ -272,6 +344,12 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(disable.status, await disable.clone().text()).toBe(200);
     const revoked = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: viewerCookie, 'x-csrf-token': viewerAuth.csrfToken } });
     expect(revoked.status).toBe(401);
+    const removeUser = await request(`/api/admin/users/${created.id}`, { method: 'DELETE' }, true);
+    expect(removeUser.status).toBe(204);
+    const usersAfterDelete = await request('/api/admin/users');
+    expect((await usersAfterDelete.json() as { users: { id: string }[] }).users.some(entry => entry.id === created.id)).toBe(false);
+    const selfDelete = await request(`/api/admin/users/${admin!.id}`, { method: 'DELETE' }, true);
+    expect(selfDelete.status).toBe(400);
   });
 
   it('requires a current password and a strong new password for credential changes', async () => {
