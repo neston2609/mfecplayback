@@ -26,6 +26,10 @@ export function isMessageRecording(metadata: any): boolean {
   return metadata?.media === 'message' || metadata?.media === 'chat' || metadata?.media === 'email';
 }
 
+export function isVoiceRecording(metadata: any): boolean {
+  return typeof metadata?.mediaType === 'string' && metadata.mediaType.trim().toLowerCase() === 'voice';
+}
+
 export async function getRecordingMedia(
   client: RecordingMetadataClient,
   conversationId: string,

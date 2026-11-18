@@ -17,4 +17,7 @@ export const MOCK_CONVERSATIONS = [
     { participantId: 'p-c4', purpose: 'customer', participantName: 'Customer', sessions: [{ ani: '+6621000104', dnis: '+6620000000', mediaType: 'voice', segments: [{ segmentStart: '2026-11-16T10:04:00.000Z', segmentEnd: '2026-11-16T10:06:10.000Z', segmentType: 'interact' }] }] },
   ] },
 ];
-export const MOCK_RECORDINGS: Record<string, unknown[]> = Object.fromEntries(MOCK_CONVERSATIONS.filter(c => c.conversationId !== 'demo-no-recording-004').map((c, index) => [c.conversationId, [{ id: `demo-recording-${index + 1}`, conversationId: c.conversationId, startTime: c.conversationStart, endTime: c.conversationEnd, media: 'audio', mediaType: 'audio', status: 'AVAILABLE', durationMs: new Date(c.conversationEnd).getTime() - new Date(c.conversationStart).getTime() }]]));
+export const MOCK_RECORDINGS: Record<string, unknown[]> = Object.fromEntries(MOCK_CONVERSATIONS.filter(c => c.conversationId !== 'demo-no-recording-004').map((c, index) => [c.conversationId, [
+  { id: `demo-recording-${index + 1}`, conversationId: c.conversationId, startTime: c.conversationStart, endTime: c.conversationEnd, media: 'audio', mediaType: 'voice', status: 'AVAILABLE', durationMs: new Date(c.conversationEnd).getTime() - new Date(c.conversationStart).getTime() },
+  { id: `demo-message-${index + 1}`, conversationId: c.conversationId, startTime: c.conversationStart, endTime: c.conversationEnd, media: 'message', mediaType: 'message', status: 'AVAILABLE' },
+]]));

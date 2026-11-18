@@ -115,10 +115,17 @@ describe('HTTP API security and Mock Mode flows', () => {
       body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-11-14T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', pageNumber: 1, pageSize: 25 }),
     }, true);
     expect(search.status).toBe(200);
-    const result = await search.json() as { mock: boolean; results: { conversationId: string; recordingCount: number }[] };
+    const result = await search.json() as { mock: boolean; results: { conversationId: string; recordingCount: number; recordings: {mediaType:string}[] }[] };
     expect(result.mock).toBe(true);
     expect(result.results).toHaveLength(3);
     expect(result.results.every(row => row.recordingCount > 0)).toBe(true);
+    expect(result.results.every(row => row.recordings.every(recording => recording.mediaType === 'voice'))).toBe(true);
+
+    const conversationRecordings=await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock');
+    expect(conversationRecordings.status).toBe(200);
+    expect(await conversationRecordings.json()).toMatchObject([{id:'demo-recording-1',mediaType:'voice'}]);
+    const messageMetadata=await request('/api/recordings/demo-message-1/metadata?connectionId=mock&conversationId=demo-ava-agent-001');
+    expect(messageMetadata.status).toBe(404);
 
     const defaultRecordingOnly = await request('/api/recordings/search', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -131,9 +138,10 @@ describe('HTTP API security and Mock Mode flows', () => {
       body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-11-14T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', includeNoRecording: true, pageNumber: 1, pageSize: 50 }),
     }, true);
     expect(missingRecording.status).toBe(200);
-    const allConversations = await missingRecording.json() as { results: { recordingCount: number }[]; pageSize: number };
+    const allConversations = await missingRecording.json() as { results: { recordingCount: number; recordings: {mediaType:string}[] }[]; pageSize: number };
     expect(allConversations.results).toHaveLength(4);
     expect(allConversations.results.some(row => row.recordingCount === 0)).toBe(true);
+    expect(allConversations.results.flatMap(row=>row.recordings).every(recording=>recording.mediaType==='voice')).toBe(true);
   });
 
   it('lists saved live connections after trusted-region validation without exposing endpoint or secret fields', async () => {

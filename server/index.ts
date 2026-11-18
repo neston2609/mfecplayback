@@ -12,7 +12,7 @@ import { conversationCommunicationIds, transcriptionRequestPath, validateTranscr
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from './wrapup.js';
 import { db, migrate } from './db/index.js';
 import { clearUserAppearance, getDefaultAppearance, getUserAppearance, parseAppearance, saveDefaultAppearance, saveUserAppearance } from './appearance.js';
-import { getRecordingMedia, isMessageRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from './recording-media.js';
+import { getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from './recording-media.js';
 import { BetterSqliteSessionStore } from './session-store.js';
 import { decrypt, encrypt, safeEqual } from './security.js';
 import { isPasswordPolicySatisfied } from './password-policy.js';
@@ -403,9 +403,9 @@ app.post('/api/recordings/search', requireAuth, requireCsrf, rateLimit({windowMs
       try {
         if(client) {
           const response = await client.get<unknown>(`/api/v2/conversations/${encodeURIComponent(c.conversationId)}/recordings`);
-          recordings = Array.isArray(response) ? response : [];
+          recordings = Array.isArray(response) ? response.filter(isVoiceRecording) : [];
         }
-        else recordings = (MOCK_RECORDINGS[c.conversationId] as any[]) || [];
+        else recordings = ((MOCK_RECORDINGS[c.conversationId] as any[]) || []).filter(isVoiceRecording);
       } catch (error) { if(error instanceof GenesysError && error.status === 404) recordings=[]; else throw error; }
       return { ...summarize(c), recordingCount:recordings.length, recordings:recordings.map(safeRecording) };
     });
@@ -413,7 +413,7 @@ app.post('/api/recordings/search', requireAuth, requireCsrf, rateLimit({windowMs
     if(!client)totalHits=visibleResults.length;
     else if(!input.includeNoRecording){totalHits=null;partial=true;}
     audit(req,'SEARCH','SUCCESS',connection?.id || 'mock',undefined,undefined,{page:input.pageNumber,includeNoRecording:input.includeNoRecording});
-    const scopeNote=!input.includeNoRecording?'Only conversations with at least one recording are shown; filtering is applied to the current Genesys page, so use Include no recording to see every conversation.':input.phone||input.dnis?'Genesys page filtered by ANI/DNIS after retrieval; this is not a complete phone search.':'Native Genesys detail query; result count depends on API response/permissions.';
+    const scopeNote=!input.includeNoRecording?'Only conversations with at least one voice recording are shown; filtering is applied to the current Genesys page, so use Include no recording to see every conversation.':input.phone||input.dnis?'Genesys page filtered by ANI/DNIS after retrieval; this is not a complete phone search.':'Native Genesys detail query; result count depends on API response/permissions.';
     res.json({ results:visibleResults, page:input.pageNumber,pageSize:input.pageSize,totalHits,partial:partial||(!input.includeNoRecording&&Boolean(client)),scope:scopeNote, mock:!client });
   } catch(error) { audit(req,'SEARCH','FAILED'); next(error); }
 });
@@ -422,11 +422,11 @@ app.get('/api/recordings/conversations/:conversationId', requireAuth, async (req
   catch(error) { next(error); }
 });
 app.get('/api/recordings/conversations/:conversationId/recordings', requireAuth, async (req,res,next) => {
-  try { const id=String(req.query.connectionId||''),conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.'); if(id==='mock'&&process.env.MOCK_MODE==='true') return res.json((MOCK_RECORDINGS[conversationId]||[]).map(safeRecording)); const c=connectionById(id,req.session.user!.id,req.session.user!.role); const items=await new GenesysClient(c).get<any[]>(`/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings`); res.json(items.map(safeRecording)); }
+  try { const id=String(req.query.connectionId||''),conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.'); if(id==='mock'&&process.env.MOCK_MODE==='true') return res.json(((MOCK_RECORDINGS[conversationId]||[]) as any[]).filter(isVoiceRecording).map(safeRecording)); const c=connectionById(id,req.session.user!.id,req.session.user!.role); const items=await new GenesysClient(c).get<any[]>(`/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings`); res.json(items.filter(isVoiceRecording).map(safeRecording)); }
   catch(error) { next(error); }
 });
 app.get('/api/recordings/:recordingId/metadata', requireAuth, async (req,res,next) => {
-  try { const cId=String(req.query.connectionId||''), conversationId=String(req.query.conversationId||''),recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.'); if(cId==='mock'&&process.env.MOCK_MODE==='true') { const r=(MOCK_RECORDINGS[conversationId] as any[]||[]).find(x=>x.id===recordingId); return r?res.json(safeRecording(r)):res.status(404).json({error:'Recording not found.'}); } const c=connectionById(cId,req.session.user!.id,req.session.user!.role); const item=await new GenesysClient(c).get<any>(recordingMediaRequestPath(conversationId,recordingId));if(!item)throw httpError(409,'Genesys did not return recording metadata.');audit(req,'RECORDING_METADATA_VIEW','SUCCESS',c.id,conversationId,recordingId); res.json(safeRecording(item)); }
+  try { const cId=String(req.query.connectionId||''), conversationId=String(req.query.conversationId||''),recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.'); if(cId==='mock'&&process.env.MOCK_MODE==='true') { const r=((MOCK_RECORDINGS[conversationId] as any[])||[]).find(x=>x.id===recordingId&&isVoiceRecording(x)); return r?res.json(safeRecording(r)):res.status(404).json({error:'Voice recording not found.'}); } const c=connectionById(cId,req.session.user!.id,req.session.user!.role); const item=await new GenesysClient(c).get<any>(recordingMediaRequestPath(conversationId,recordingId));if(!item)throw httpError(409,'Genesys did not return recording metadata.');if(!isVoiceRecording(item))throw httpError(404,'Voice recording not found.');audit(req,'RECORDING_METADATA_VIEW','SUCCESS',c.id,conversationId,recordingId); res.json(safeRecording(item)); }
   catch(error) { next(error); }
 });
 app.get('/api/recordings/conversations/:conversationId/transcription', requireAuth, requireRole('administrator','supervisor','quality_analyst'), async (req,res,next) => {
@@ -475,6 +475,7 @@ app.get('/api/recordings/:recordingId/stream', requireAuth, async (req,res,next)
     const c=connectionById(cId,req.session.user!.id,req.session.user!.role); const client=new GenesysClient(c);
     const recordingId=String(req.params.recordingId); const playable=await getRecordingMedia(client,conversationId,recordingId);
     if(!playable) throw httpError(409,'Genesys has not made playable media available yet. Confirm the recording is finalized and that the service account has permission to download recordings in the conversation’s division; then retry.');
+    if(!isVoiceRecording(playable.metadata))throw httpError(409,'Only voice recordings can be played.');
     const uri=playable.mediaUri;
     const headers: Record<string,string>={}; if(req.headers.range) headers.Range=req.headers.range;
     let media=await fetchTrustedMedia(uri,c,headers);
@@ -495,7 +496,7 @@ app.get('/api/recordings/:recordingId/stream', requireAuth, async (req,res,next)
 });
 app.get('/api/recordings/:recordingId/download', requireAuth, requireRole('administrator','supervisor','quality_analyst'), async (req,res,next) => {
   let connection:Connection|undefined,conversationId='',recordingId='';
-   try { conversationId=String(req.query.conversationId||'');recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.');connection=connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role);const playable=await getRecordingMedia(new GenesysClient(connection),conversationId,recordingId);if(!playable)throw httpError(409,'Genesys has not made downloadable media available yet. Confirm the recording is finalized and that the service account has permission to download recordings in the conversation’s division; then retry.');const response=await fetchTrustedMedia(playable.mediaUri,connection,{});const extension=isZipMediaContentType(response.headers.get('content-type'))?'.zip':'';res.setHeader('Content-Disposition',`attachment; filename="recording-${recordingId.replace(/[^a-zA-Z0-9_-]/g,'_')}${extension}"`);await pipeMedia(req,res,response,{allowZip:true});audit(req,'DOWNLOAD','SUCCESS',connection.id,conversationId,recordingId);}
+   try { conversationId=String(req.query.conversationId||'');recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.');connection=connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role);const playable=await getRecordingMedia(new GenesysClient(connection),conversationId,recordingId);if(!playable)throw httpError(409,'Genesys has not made downloadable media available yet. Confirm the recording is finalized and that the service account has permission to download recordings in the conversation’s division; then retry.');if(!isVoiceRecording(playable.metadata))throw httpError(409,'Only voice recordings can be downloaded.');const response=await fetchTrustedMedia(playable.mediaUri,connection,{});const extension=isZipMediaContentType(response.headers.get('content-type'))?'.zip':'';res.setHeader('Content-Disposition',`attachment; filename="recording-${recordingId.replace(/[^a-zA-Z0-9_-]/g,'_')}${extension}"`);await pipeMedia(req,res,response,{allowZip:true});audit(req,'DOWNLOAD','SUCCESS',connection.id,conversationId,recordingId);}
   catch(error) { audit(req,'DOWNLOAD','FAILED',connection?.id,conversationId||undefined,recordingId||undefined);next(error); }
 });
 app.get('/api/dashboard/summary', requireAuth, async (req,res,next) => {
@@ -537,9 +538,9 @@ app.get('/api/dashboard/summary', requireAuth, async (req,res,next) => {
     }
     let recordingsKnown=true;
     const enriched=await mapWithConcurrency(conversations,5,async conversation=>{
-      let recordingCount=(MOCK_RECORDINGS[conversation.conversationId] as any[]||[]).length;
+       let recordingCount=((MOCK_RECORDINGS[conversation.conversationId] as any[]||[]).filter(isVoiceRecording)).length;
       if(client){
-        try{const recordings=await client.get<unknown>(`/api/v2/conversations/${encodeURIComponent(conversation.conversationId)}/recordings`);recordingCount=Array.isArray(recordings)?recordings.length:0;}
+        try{const recordings=await client.get<unknown>(`/api/v2/conversations/${encodeURIComponent(conversation.conversationId)}/recordings`);recordingCount=Array.isArray(recordings)?recordings.filter(isVoiceRecording).length:0;}
         catch(error){if(error instanceof GenesysError&&error.status===404)recordingCount=0;else if(error instanceof GenesysError&&error.status===403){recordingsKnown=false;partial=true;recordingCount=0;}else throw error;}
       }
       return {conversation,recordingCount};

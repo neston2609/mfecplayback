@@ -4,7 +4,7 @@ import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../reg
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
-import { getRecordingMedia, isMessageRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
+import { getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from '../wrapup.js';
@@ -164,6 +164,17 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(isZipMediaContentType('application/octet-stream')).toBe(false);
     expect(isMessageRecording({ media: 'message' })).toBe(true);
     expect(isMessageRecording({ media: 'voice' })).toBe(false);
+    expect(isVoiceRecording({ mediaType: 'voice' })).toBe(true);
+    expect(isVoiceRecording({ mediaType: 'VOICE' })).toBe(true);
+    expect(isVoiceRecording({ mediaType: 'message' })).toBe(false);
+    expect(isVoiceRecording({ media: 'voice' })).toBe(false);
+  });
+
+  it('keeps only voice media in the synthetic recording fixtures', () => {
+    const mediaTypes = Object.values(MOCK_RECORDINGS).flatMap(items => (items as {mediaType:string}[]).filter(isVoiceRecording).map(item => item.mediaType));
+    expect(mediaTypes.length).toBeGreaterThan(0);
+    expect(mediaTypes.every(mediaType => mediaType === 'voice')).toBe(true);
+    expect(Object.values(MOCK_RECORDINGS).some(items => (items as {mediaType:string}[]).some(item => item.mediaType === 'message'))).toBe(true);
   });
 
   it('extracts one supported and verified audio file from ZIP without writing archive paths', () => {
