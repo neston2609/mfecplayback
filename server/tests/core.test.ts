@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { REGIONS, trustedBaseUrl } from '../regions.js';
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
+import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
@@ -46,4 +47,39 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
       expect(Date.parse(conversation.conversationEnd)).toBeGreaterThan(Date.parse(conversation.conversationStart));
     }
   });
+
+  it('authenticates with OAuth and verifies organization API access', async () => {
+    const originalFetch = globalThis.fetch;
+    const originalMode = process.env.MOCK_MODE;
+    process.env.MOCK_MODE = 'false';
+    const requests: { url: string; authorization: string | null }[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      requests.push({ url, authorization: new Headers(init?.headers).get('authorization') });
+      if (url.endsWith('/oauth/token')) return new Response(JSON.stringify({ access_token: 'test-token', expires_in: 300 }), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ id: 'org-123', name: 'Test organization' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    const client = new GenesysClient({
+      id: `genesys-test-${crypto.randomUUID()}`, name: 'Test', organization_label: 'Test', region_id: 'us-east-1',
+      api_base_url: 'https://api.mypurecloud.com', oauth_base_url: 'https://login.mypurecloud.com',
+      client_id: 'test-client', client_secret_enc: encrypt('test-secret'), enabled: 1, is_default: 0,
+    });
+
+    try {
+      await client.accessToken();
+      const organization = await verifyGenesysApiAccess(client);
+      expect(organization).toEqual({ id: 'org-123', name: 'Test organization' });
+      expect(requests.map(request => request.url)).toEqual([
+        'https://login.mypurecloud.com/oauth/token',
+        'https://api.mypurecloud.com/api/v2/organizations/me',
+      ]);
+      expect(requests[1].authorization).toBe('Bearer test-token');
+    } finally {
+      client.clearCachedToken();
+      globalThis.fetch = originalFetch;
+      if (originalMode === undefined) delete process.env.MOCK_MODE;
+      else process.env.MOCK_MODE = originalMode;
+    }
+  });
+
 });

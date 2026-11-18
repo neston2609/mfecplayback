@@ -41,7 +41,7 @@ Open <http://localhost:5173>. The initial administrator is created only when the
 2. Configure a Genesys OAuth Client Credentials integration for a dedicated least-privilege service account.
 3. Grant the service identity only the permissions needed for analytics conversation detail and recording discovery/view/playback. Validate actual permissions against the target organization and applicable divisions.
 4. Sign in as an application Administrator and add the named organization under **Genesys Configuration**. Select an allowlisted region; endpoint URLs are fixed to official regional API/OAuth hosts, preventing arbitrary endpoint SSRF or credential exfiltration.
-5. Test OAuth connectivity. A successful OAuth grant alone does not verify every analytics, division, recording, or media permission.
+5. Use **Test Connection** in the configuration dialog to verify OAuth and a Genesys organization API request (`GET /api/v2/organizations/me`). Draft credentials are tested server-side without saving them. This does not verify every analytics, division, recording, or media permission.
 6. Run a short bounded search and confirm recordings through a controlled QA process.
 
 Client Credentials use a service identity; they do **not** automatically inherit the logged-in app user's Genesys permissions. Application organization access and roles are additional restrictions, not delegated Genesys enforcement.

@@ -93,6 +93,16 @@ describe('HTTP API security and Mock Mode flows', () => {
     const crossOrigin = await request('/api/genesys/connections', { headers: { Origin: 'https://attacker.example' } });
     expect(crossOrigin.status).toBe(403);
 
+    const noCsrfConnectionTest = await request('/api/genesys/connections/test', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    });
+    expect(noCsrfConnectionTest.status).toBe(403);
+    const mockConnectionTest = await request('/api/genesys/connections/test', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    }, true);
+    expect(mockConnectionTest.status).toBe(409);
+    expect((await mockConnectionTest.json() as { error: string }).error).toMatch(/Mock Mode/i);
+
     const search = await request('/api/recordings/search', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-11-14T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', pageNumber: 1, pageSize: 25 }),

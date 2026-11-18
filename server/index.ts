@@ -11,7 +11,8 @@ import { db, migrate } from './db/index.js';
 import { BetterSqliteSessionStore } from './session-store.js';
 import { encrypt, safeEqual } from './security.js';
 import { REGIONS, trustedBaseUrl } from './regions.js';
-import { connectionById, GenesysClient, GenesysError, type Connection } from './genesys.js';
+import { connectionById, type Connection } from './genesys.js';
+import { GenesysClient, GenesysError, verifyGenesysApiAccess } from './genesys-client.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from './mock.js';
 
 declare module 'express-session' { interface SessionData { user?: { id: string; username: string; role: string }; csrf?: string } }
@@ -137,12 +138,41 @@ app.put('/api/genesys/connections/:id', requireAuth, requireAdmin, requireCsrf, 
     const regionChanged=(input.regionId||existing.region_id)!==existing.region_id;
     const clientChanged=(input.clientId&&input.clientId!==existing.client_id)||Boolean(input.clientSecret);
     const transaction=db.transaction(()=>{if(nextDefault)db.prepare('UPDATE connections SET is_default=0').run();db.prepare('UPDATE connections SET name=?,organization_label=?,region_id=?,api_base_url=?,oauth_base_url=?,client_id=?,client_secret_enc=?,enabled=?,is_default=?,updated_at=?,last_error=NULL WHERE id=?').run(input.name ?? existing.name,input.organizationLabel ?? existing.organization_label,input.regionId ?? existing.region_id,apiUrl,oauthUrl,nextClientId,nextSecret,Number(nextEnabled),Number(nextDefault),new Date().toISOString(),existing.id);if(!nextEnabled||regionChanged||clientChanged)db.prepare('DELETE FROM user_connection_access WHERE connection_id=?').run(existing.id);});transaction();
+    new GenesysClient(existing).clearCachedToken();
     audit(req,'CONNECTION_UPDATE','SUCCESS',existing.id); res.json({ ok:true });
   } catch(error) { next(error); }
 });
 app.delete('/api/genesys/connections/:id', requireAuth, requireAdmin, requireCsrf, (req,res,next) => {
-    try { const id=String(req.params.id);if(!db.prepare('SELECT id FROM connections WHERE id=?').get(id))throw httpError(404,'Connection not found.');if(process.env.MOCK_MODE==='true')throw httpError(409,'Disable Mock Mode and restart the application before changing live connections.');db.prepare('DELETE FROM connections WHERE id=?').run(id); audit(req,'CONNECTION_DELETE','SUCCESS',id); res.status(204).end(); }
+    try { const id=String(req.params.id);const connection=db.prepare('SELECT * FROM connections WHERE id=?').get(id) as Connection|undefined;if(!connection)throw httpError(404,'Connection not found.');if(process.env.MOCK_MODE==='true')throw httpError(409,'Disable Mock Mode and restart the application before changing live connections.');db.prepare('DELETE FROM connections WHERE id=?').run(id);new GenesysClient(connection).clearCachedToken();audit(req,'CONNECTION_DELETE','SUCCESS',id);res.status(204).end(); }
   catch(error) { next(error); }
+});
+app.post('/api/genesys/connections/test', requireAuth, requireAdmin, requireCsrf, async (req,res,next) => {
+  try {
+    if(process.env.MOCK_MODE==='true')throw httpError(409,'Mock Mode is active. Live Genesys connectivity tests are disabled.');
+    const input=connectionTestSchema.parse(req.body);
+    const region=REGIONS.find(value=>value.id===input.regionId);
+    if(!region)throw httpError(400,'Unknown Genesys region.');
+    let apiUrl:string,oauthUrl:string;
+    try{apiUrl=trustedBaseUrl(input.apiBaseUrl||region.api,'api');oauthUrl=trustedBaseUrl(input.oauthBaseUrl||region.oauth,'oauth');}
+    catch{throw httpError(400,'The endpoint must exactly match an official Genesys Cloud region URL.');}
+    if(apiUrl!==region.api||oauthUrl!==region.oauth)throw httpError(400,'API and OAuth base URLs must match the selected official region.');
+    let secretEnc:string;
+    if(input.clientSecret)secretEnc=encrypt(input.clientSecret);
+    else {
+      if(!input.existingConnectionId)throw httpError(400,'Enter the OAuth client secret to test this connection.');
+      const existing=db.prepare('SELECT * FROM connections WHERE id=?').get(input.existingConnectionId) as Connection|undefined;
+      if(!existing)throw httpError(404,'Saved connection not found.');
+      if(input.clientId!==existing.client_id)throw httpError(400,'Enter the client secret when changing the OAuth Client ID.');
+      if(input.regionId!==existing.region_id)throw httpError(400,'Enter the client secret when changing the Genesys region.');
+      secretEnc=existing.client_secret_enc;
+    }
+    const client=new GenesysClient({id:`draft-${crypto.randomUUID()}`,name:input.name,organization_label:input.organizationLabel,region_id:input.regionId,api_base_url:apiUrl,oauth_base_url:oauthUrl,client_id:input.clientId,client_secret_enc:secretEnc,enabled:1,is_default:0});
+    let organization:{id?:string;name?:string};
+    try { await client.accessToken(); organization=await verifyGenesysApiAccess(client); }
+    finally { client.clearCachedToken(); }
+    audit(req,'CONNECTION_TEST','SUCCESS',input.existingConnectionId,undefined,undefined,{draft:true,regionId:input.regionId});
+    res.json({ok:true,message:`OAuth authentication and Genesys organization API access succeeded${organization.name?` for "${organization.name}"`:''}.`});
+  } catch(error) { audit(req,'CONNECTION_TEST','FAILED',undefined,undefined,undefined,{draft:true}); next(error); }
 });
 app.post('/api/genesys/connections/:id/test', requireAuth, requireAdmin, requireCsrf, async (req,res,next) => {
   try {
@@ -151,9 +181,12 @@ app.post('/api/genesys/connections/:id/test', requireAuth, requireAdmin, require
     if (!connection) throw httpError(404,'Connection not found.');
     if(!connection.enabled)throw httpError(409,'Enable the connection before testing it.');
     if(!REGIONS.some(value=>value.id===connection.region_id&&value.api===connection.api_base_url&&value.oauth===connection.oauth_base_url))throw httpError(409,'The connection endpoints are not trusted.');
-    const client = new GenesysClient(connection); await client.accessToken();
+    const client = new GenesysClient(connection); client.clearCachedToken();
+    let organization:{id?:string;name?:string};
+    try { await client.accessToken(); organization=await verifyGenesysApiAccess(client); }
+    finally { client.clearCachedToken(); }
     const now = new Date().toISOString(); db.prepare('UPDATE connections SET last_success_at=?,last_error=NULL WHERE id=?').run(now,connection.id);
-    audit(req,'CONNECTION_TEST','SUCCESS',connection.id); res.json({ ok:true,message:'OAuth authentication succeeded.' });
+    audit(req,'CONNECTION_TEST','SUCCESS',connection.id); res.json({ ok:true,message:`OAuth authentication and Genesys organization API access succeeded${organization.name?` for "${organization.name}"`:''}.` });
   } catch(error) { const safe = publicError(error); const id=String(req.params.id); if(id) db.prepare('UPDATE connections SET last_error=? WHERE id=?').run(safe,id); audit(req,'CONNECTION_TEST','FAILED',id); next(error); }
 });
 app.get('/api/genesys/connections/:id/permissions', requireAuth, requireAdmin, (req,res,next) => {
@@ -275,6 +308,7 @@ function bootstrapUser() {
 }
 function awaitHash(password:string){return bcrypt.hashSync(password,12);}
 const connectionSchema=z.object({name:z.string().trim().min(1).max(120),organizationLabel:z.string().trim().min(1).max(120),regionId:z.string().min(1).max(64),apiBaseUrl:z.string().url().optional(),oauthBaseUrl:z.string().url().optional(),clientId:z.string().trim().min(1).max(256),clientSecret:z.string().min(1).max(1024),enabled:z.boolean().default(true),isDefault:z.boolean().default(false)});
+const connectionTestSchema=connectionSchema.partial({clientSecret:true}).extend({clientSecret:z.string().max(1024).optional(),existingConnectionId:z.string().uuid().optional()});
 const searchSchema=z.object({connectionId:z.string().min(1),intervalStart:z.string().datetime({offset:true}),intervalEnd:z.string().datetime({offset:true}),pageNumber:z.number().int().min(1).default(1),pageSize:z.number().int().min(1).max(100).default(25),agentId:z.string().optional(),queueId:z.string().optional(),direction:z.enum(['inbound','outbound']).optional(),phone:z.string().max(80).optional(),dnis:z.string().max(80).optional(),conversationId:z.string().max(128).optional()});
 function requireAuth(req:Request,res:ExpressResponse,next:NextFunction){const sessionUser=req.session.user;if(!sessionUser)return res.status(401).json({error:'Sign in required.'});const account=db.prepare('SELECT username,role,enabled FROM users WHERE id=?').get(sessionUser.id) as {username:string;role:string;enabled:number}|undefined;if(!account||!account.enabled){req.session.destroy(()=>{});return res.status(401).json({error:'Your account is disabled or no longer exists.'});}req.session.user={id:sessionUser.id,username:account.username,role:account.role};next();}
 function requireAdmin(req:Request,res:ExpressResponse,next:NextFunction){if(req.session.user?.role!=='administrator')return res.status(403).json({error:'Administrator role required.'});next();}
