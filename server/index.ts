@@ -295,7 +295,10 @@ app.post('/api/recordings/search', requireAuth, requireCsrf, rateLimit({windowMs
     const enriched = await mapWithConcurrency(conversations,5,async c => {
       let recordings: any[] = [];
       try {
-        if(client) recordings = await client.get<any[]>(`/api/v2/conversations/${encodeURIComponent(c.conversationId)}/recordings`);
+        if(client) {
+          const response = await client.get<unknown>(`/api/v2/conversations/${encodeURIComponent(c.conversationId)}/recordings`);
+          recordings = Array.isArray(response) ? response : [];
+        }
         else recordings = (MOCK_RECORDINGS[c.conversationId] as any[]) || [];
       } catch (error) { if(error instanceof GenesysError && error.status === 404) recordings=[]; else throw error; }
       return { ...summarize(c), recordingCount:recordings.length, recordings:recordings.map(safeRecording) };

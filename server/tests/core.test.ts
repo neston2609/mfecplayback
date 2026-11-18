@@ -66,6 +66,7 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
       const url = String(input);
       requests.push({ url, authorization: new Headers(init?.headers).get('authorization') });
       if (url.endsWith('/oauth/token')) return new Response(JSON.stringify({ access_token: 'test-token', expires_in: 300 }), { status: 200, headers: { 'content-type': 'application/json' } });
+      if (url.endsWith('/recordings')) return new Response(null, { status: 200 });
       return new Response(JSON.stringify({ id: 'org-123', name: 'Test organization' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }) as typeof fetch;
     const client = new GenesysClient({
@@ -78,9 +79,11 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
       await client.accessToken();
       const organization = await verifyGenesysApiAccess(client);
       expect(organization).toEqual({ id: 'org-123', name: 'Test organization' });
+      await expect(client.get('/api/v2/conversations/test-conversation/recordings')).resolves.toBeUndefined();
       expect(requests.map(request => request.url)).toEqual([
         'https://login.mypurecloud.com/oauth/token',
         'https://api.mypurecloud.com/api/v2/organizations/me',
+        'https://api.mypurecloud.com/api/v2/conversations/test-conversation/recordings',
       ]);
       expect(requests[1].authorization).toBe('Bearer test-token');
     } finally {

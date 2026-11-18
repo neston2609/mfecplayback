@@ -36,7 +36,13 @@ export class GenesysClient {
           body: payload ? JSON.stringify(payload) : undefined,
         });
       } catch { if (attempt < 2 && method === 'GET') {await new Promise(resolve=>setTimeout(resolve,250*(attempt+1)));continue;} throw new GenesysError(503,'Genesys API could not be reached.'); }
-      if (response.ok) { if (response.status === 204) return undefined as T; return await response.json() as T; }
+      if (response.ok) {
+        if (response.status === 204) return undefined as T;
+        const body = await response.text();
+        if (!body.trim()) return undefined as T;
+        try { return JSON.parse(body) as T; }
+        catch { throw new GenesysError(502, 'Genesys API returned an invalid JSON response.'); }
+      }
       if (response.status >= 300 && response.status < 400) throw new GenesysError(502, 'Genesys API returned an unexpected redirect.');
       if (response.status === 401 && attempt === 0) { tokens.delete(this.connection.id); continue; }
       if (response.status === 429 || [502, 503, 504].includes(response.status)) {
