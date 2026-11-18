@@ -124,6 +124,8 @@ describe('HTTP API security and Mock Mode flows', () => {
     const conversationRecordings=await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock');
     expect(conversationRecordings.status).toBe(200);
     expect(await conversationRecordings.json()).toMatchObject([{id:'demo-recording-1',mediaType:'voice'}]);
+    const messageRecordings=await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock');
+    expect((await messageRecordings.json() as {mediaType:string}[]).every(recording=>recording.mediaType==='voice')).toBe(true);
     const messageMetadata=await request('/api/recordings/demo-message-1/metadata?connectionId=mock&conversationId=demo-ava-agent-001');
     expect(messageMetadata.status).toBe(404);
 

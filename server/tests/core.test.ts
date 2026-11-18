@@ -4,7 +4,7 @@ import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../reg
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
-import { getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
+import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from '../wrapup.js';
@@ -168,6 +168,15 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(isVoiceRecording({ mediaType: 'VOICE' })).toBe(true);
     expect(isVoiceRecording({ mediaType: 'message' })).toBe(false);
     expect(isVoiceRecording({ media: 'voice' })).toBe(false);
+    const voiceConversation={participants:[{sessions:[{mediaType:'voice'}]}]};
+    const messageConversation={participants:[{sessions:[{mediaType:'message'}]}]};
+    expect(conversationHasVoiceSession(voiceConversation)).toBe(true);
+    expect(conversationHasVoiceSession(messageConversation)).toBe(false);
+    expect(isVoiceRecording({media:'audio'},voiceConversation)).toBe(true);
+    expect(isVoiceRecording({mediaType:'voice',media:'message'},voiceConversation)).toBe(false);
+    expect(isVoiceRecording({media:'message'},voiceConversation)).toBe(false);
+    expect(isVoiceRecording({media:'audio'},messageConversation)).toBe(false);
+    expect(isVoiceRecording({media:'audio'})).toBe(false);
   });
 
   it('keeps only voice media in the synthetic recording fixtures', () => {

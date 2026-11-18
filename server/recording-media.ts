@@ -26,8 +26,20 @@ export function isMessageRecording(metadata: any): boolean {
   return metadata?.media === 'message' || metadata?.media === 'chat' || metadata?.media === 'email';
 }
 
-export function isVoiceRecording(metadata: any): boolean {
-  return typeof metadata?.mediaType === 'string' && metadata.mediaType.trim().toLowerCase() === 'voice';
+export function conversationHasVoiceSession(conversation: any): boolean {
+  return Array.isArray(conversation?.participants) && conversation.participants.some((participant: any) =>
+    Array.isArray(participant?.sessions) && participant.sessions.some((session: any) =>
+      typeof session?.mediaType === 'string' && session.mediaType.trim().toLowerCase() === 'voice',
+    ),
+  );
+}
+
+export function isVoiceRecording(recording: any, conversation?: any): boolean {
+  if (isMessageRecording(recording)) return false;
+  if (typeof recording?.mediaType === 'string') return recording.mediaType.trim().toLowerCase() === 'voice';
+  // Genesys recording metadata identifies voice recordings as `media: audio`;
+  // the associated Analytics conversation identifies the channel as `mediaType: voice`.
+  return typeof recording?.media === 'string' && recording.media.trim().toLowerCase() === 'audio' && conversationHasVoiceSession(conversation);
 }
 
 export async function getRecordingMedia(
