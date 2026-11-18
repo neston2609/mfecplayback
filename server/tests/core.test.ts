@@ -4,6 +4,7 @@ import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../reg
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
+import { queryAllConversations } from '../conversation-query.js';
 import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
@@ -14,6 +15,31 @@ import { parseSmtpSettings, publicSmtpSettings } from '../mailer.js';
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
   afterAll(() => { delete process.env.MASTER_ENCRYPTION_KEY; });
+
+  it('loads all Analytics conversation pages and deduplicates repeated conversations', async () => {
+    const requests: { interval: string; pageNumber: number; pageSize: number }[] = [];
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({ conversationId: `conversation-${index + 1}` }));
+    const pages = [
+      { conversations: firstPage, totalHits: 101 },
+      { conversations: [{ conversationId: 'conversation-100' }, { conversationId: 'conversation-101' }], totalHits: 101 },
+    ];
+    const client = { async post<T>(_path: string, body: any): Promise<T> {
+      requests.push({ interval: body.interval, pageNumber: body.paging.pageNumber, pageSize: body.paging.pageSize });
+      return pages[body.paging.pageNumber - 1] as T;
+    } };
+
+    const result = await queryAllConversations(client, '2026-11-17T00:00:00.000Z/2026-11-18T00:00:00.000Z', {
+      conversationFilters: [{ type: 'and', predicates: [] }],
+    });
+
+    expect(requests).toEqual([
+      { interval: '2026-11-17T00:00:00.000Z/2026-11-18T00:00:00.000Z', pageNumber: 1, pageSize: 100 },
+      { interval: '2026-11-17T00:00:00.000Z/2026-11-18T00:00:00.000Z', pageNumber: 2, pageSize: 100 },
+    ]);
+    expect(result.conversations).toHaveLength(101);
+    expect(result.conversations.at(-1)?.conversationId).toBe('conversation-101');
+    expect(result).toMatchObject({ totalHits: 101, partial: false });
+  });
 
   it('enforces the requested eight-character password rules without requiring both cases', () => {
     expect(checkPasswordPolicy('abcdefgh','abcdefgh')).toEqual({minLength:true,hasLetter:true,hasNumberOrSpecial:false,matchesConfirmation:true});
@@ -127,16 +153,35 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     const requested: string[] = [];
     const client = { async get<T>(endpoint: string): Promise<T> {
       requested.push(endpoint);
-      return (requested.length < 3 ? undefined : { mediaUris: { S: { mediaUri: 'https://prod-recording-playback.s3.amazonaws.com/audio?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig' } } }) as T;
+      if (endpoint.endsWith('/recordings')) return [] as T;
+      return (requested.filter(item => item.includes('/recordings/recording?')).length < 3 ? undefined : { mediaUris: { S: { mediaUri: 'https://prod-recording-playback.s3.amazonaws.com/audio?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig' } } }) as T;
     } };
     const result = await getRecordingMedia(client, 'conversation', 'recording', async () => undefined);
-    expect(requested).toHaveLength(3);
-    expect(requested.every(endpoint => endpoint.includes('download=true'))).toBe(true);
+    expect(requested).toHaveLength(4);
+    expect(requested[1]).toBe('/api/v2/conversations/conversation/recordings');
+    expect(requested.filter(endpoint => endpoint.includes('/recordings/recording?')).every(endpoint => endpoint.includes('download=true'))).toBe(true);
     expect(result?.mediaUri).toContain('X-Amz-Signature=sig');
     let attempts = 0;
     const unavailableClient = { async get<T>(): Promise<T> { attempts++; return undefined as T; } };
     expect(await getRecordingMedia(unavailableClient, 'conversation', 'pending', async () => undefined)).toBeUndefined();
-    expect(attempts).toBe(8);
+    expect(attempts).toBe(9);
+  });
+
+  it('uses the media URI from the matching recording list item when detail metadata has none', async () => {
+    const requested: string[] = [];
+    const client = { async get<T>(endpoint: string): Promise<T> {
+      requested.push(endpoint);
+      if (endpoint.endsWith('/recordings')) return [{ id: 'other-recording', mediaUris: { WEBM: { mediaUri: 'https://wrong.example/audio' } } }, { id: 'wanted-recording', mediaUris: { WEBM: { mediaUri: 'https://prod-recording-playback.s3.amazonaws.com/audio?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig' } } }] as T;
+      return { id: 'wanted-recording', mediaUris: {} } as T;
+    } };
+
+    const result = await getRecordingMedia(client, 'conversation', 'wanted-recording', async () => undefined);
+    expect(requested).toEqual([
+      '/api/v2/conversations/conversation/recordings/wanted-recording?formatId=WEBM&download=true',
+      '/api/v2/conversations/conversation/recordings',
+    ]);
+    expect(result?.metadata.id).toBe('wanted-recording');
+    expect(result?.mediaUri).toContain('X-Amz-Signature=sig');
   });
 
   it('allows only signed Genesys recording storage URLs and known regional media hosts', () => {

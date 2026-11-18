@@ -49,10 +49,22 @@ export async function getRecordingMedia(
   wait: (milliseconds: number) => Promise<void> = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
 ) {
   const path = recordingMediaRequestPath(conversationId, recordingId);
+  const listPath = `/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings`;
   for (let attempt = 0; attempt < 8; attempt++) {
     const metadata = await client.get<any>(path);
     const mediaUri = recordingMediaUri(metadata);
     if (mediaUri) return { metadata, mediaUri };
+    // Genesys may return a media URI on the conversation recording list while
+    // the individual recording download metadata omits it. Match the recording
+    // ID exactly and never borrow another recording's media URI.
+    if (attempt === 0) {
+      const recordings = await client.get<any>(listPath);
+      const listed = Array.isArray(recordings)
+        ? recordings.find((recording: any) => (recording?.id || recording?.recordingId) === recordingId)
+        : undefined;
+      const listedMediaUri = recordingMediaUri(listed);
+      if (listed && listedMediaUri) return { metadata: listed, mediaUri: listedMediaUri };
+    }
     if (attempt < 7) await wait(750 * (attempt + 1));
   }
   return undefined;

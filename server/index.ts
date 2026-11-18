@@ -12,7 +12,8 @@ import { conversationCommunicationIds, transcriptionRequestPath, validateTranscr
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from './wrapup.js';
 import { db, migrate } from './db/index.js';
 import { clearUserAppearance, getDefaultAppearance, getUserAppearance, parseAppearance, saveDefaultAppearance, saveUserAppearance } from './appearance.js';
-import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from './recording-media.js';
+import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, recordingMediaRequestPath, recordingMediaUri, validateRecordingMediaUrl } from './recording-media.js';
+import { MAX_ANALYTICS_CONVERSATIONS, queryAllConversations } from './conversation-query.js';
 import { BetterSqliteSessionStore } from './session-store.js';
 import { decrypt, encrypt, safeEqual } from './security.js';
 import { isPasswordPolicySatisfied } from './password-policy.js';
@@ -374,55 +375,78 @@ app.post('/api/recordings/search', requireAuth, requireCsrf, rateLimit({windowMs
     if (!connection && !(input.connectionId === 'mock' && process.env.MOCK_MODE === 'true')) throw httpError(404,'Connection not found or access denied.');
     const from = Date.parse(input.intervalStart), to = Date.parse(input.intervalEnd);
     if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) throw httpError(400,'Choose a valid start and end time.');
-    if (to - from > 7 * 86400000) throw httpError(400,'A single Genesys conversation-details query is limited to seven days. Narrow the interval; asynchronous search is not available in this release.');
+    if (to - from > 90 * 86400000) throw httpError(400,'Search intervals are limited to 90 days. Narrow the date range to continue.');
     const client = connection ? new GenesysClient(connection) : null;
     let conversations: any[] = [], totalHits: number | null = null, partial = false;
     if (!client) {
       conversations = MOCK_CONVERSATIONS.filter(c => Date.parse(c.conversationStart) >= from && Date.parse(c.conversationStart) <= to && mockMatches(c,input) && (!input.conversationId||c.conversationId===input.conversationId) && (input.includeNoRecording||(MOCK_RECORDINGS[c.conversationId] as any[]||[]).length>0));
       totalHits = conversations.length;
     } else {
+      const segmentPredicates: any[] = [];
+      if(input.agentId) segmentPredicates.push({type:'dimension',dimension:'userId',operator:'matches',value:input.agentId});
+      if(input.queueId) segmentPredicates.push({type:'dimension',dimension:'queueId',operator:'matches',value:input.queueId});
+      const analyticsFilters: Record<string,unknown> = {};
+      if(input.direction) analyticsFilters.conversationFilters=[{type:'and',predicates:[{type:'dimension',dimension:'originatingDirection',operator:'matches',value:input.direction}]}];
+      if(segmentPredicates.length) analyticsFilters.segmentFilters=[{type:'and',predicates:segmentPredicates}];
+
       if(input.conversationId) {
         const conversation=await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(input.conversationId)}/details`);
         conversations=conversation?.conversationId===input.conversationId && Date.parse(conversation.conversationStart)>=from && Date.parse(conversation.conversationStart)<=to && matchesConversationFilters(conversation,input) ? [conversation] : [];
         totalHits=conversations.length;
       } else {
-        const body: Record<string,unknown> = { interval: `${new Date(from).toISOString()}/${new Date(to).toISOString()}`, paging:{ pageSize:input.pageSize,pageNumber:input.pageNumber }, order:'desc', orderBy:'conversationStart' };
-        const segmentPredicates: any[] = [];
-        if(input.agentId) segmentPredicates.push({type:'dimension',dimension:'userId',operator:'matches',value:input.agentId});
-        if(input.queueId) segmentPredicates.push({type:'dimension',dimension:'queueId',operator:'matches',value:input.queueId});
-        if(input.direction) body.conversationFilters=[{type:'and',predicates:[{type:'dimension',dimension:'originatingDirection',operator:'matches',value:input.direction}]}];
-        if(segmentPredicates.length) body.segmentFilters=[{type:'and',predicates:segmentPredicates}];
-        const response = await client.post<{conversations?:any[];totalHits?:number;totalCount?:number;nextUri?:string}>('/api/v2/analytics/conversations/details/query',body);
-        conversations = response.conversations || []; totalHits = response.totalHits ?? response.totalCount ?? null;
+        if(to-from<=7*86400000){
+          const response=await queryAllConversations(client,`${new Date(from).toISOString()}/${new Date(to).toISOString()}`,analyticsFilters);
+          conversations=response.conversations;totalHits=response.totalHits;partial=response.partial;
+        }else{
+          const unique=new Map<string,any>();
+          for(let chunkStart=from;chunkStart<to;){
+            const chunkEnd=Math.min(to,chunkStart+7*86400000);
+            const remaining=MAX_ANALYTICS_CONVERSATIONS-unique.size;
+            if(remaining<=0){partial=true;break;}
+            const response=await queryAllConversations(client,`${new Date(chunkStart).toISOString()}/${new Date(chunkEnd).toISOString()}`,analyticsFilters,remaining);
+            for(const conversation of response.conversations)if(conversation?.conversationId&&!unique.has(conversation.conversationId))unique.set(conversation.conversationId,conversation);
+            partial||=response.partial;
+            if(unique.size>=MAX_ANALYTICS_CONVERSATIONS){partial=true;break;}
+            chunkStart=chunkEnd;
+          }
+          conversations=[...unique.values()].filter(conversation=>{const start=Date.parse(conversation.conversationStart);return start>=from&&start<to;});
+          totalHits=partial?null:conversations.length;
+        }
       }
-      // ANI/DNIS are deliberately post-filtered on the current native page: Genesys analytics does not provide a documented universally available ANI/DNIS filter in this path.
-      if(input.phone || input.dnis) { conversations = conversations.filter(c=>matchesPhone(c,input)); partial = true; }
+      // Apply ANI/DNIS only after paging the entire Analytics query, otherwise
+      // matching conversations beyond the first page would be silently lost.
+      if(input.phone || input.dnis) conversations=conversations.filter(conversation=>matchesPhone(conversation,input));
     }
+    conversations.sort((a,b)=>Date.parse(b.conversationStart||'')-Date.parse(a.conversationStart||''));
     const enriched = await mapWithConcurrency(conversations,5,async c => {
-      let recordings: any[] = [];
+      let recordings: any[] = [],recordingListAvailable=true;
       try {
         if(client) {
           const response = await client.get<unknown>(`/api/v2/conversations/${encodeURIComponent(c.conversationId)}/recordings`);
           recordings = Array.isArray(response) ? response.filter(recording => isVoiceRecording(recording,c)) : [];
         }
         else recordings = ((MOCK_RECORDINGS[c.conversationId] as any[]) || []).filter(recording => isVoiceRecording(recording,c));
-      } catch (error) { if(error instanceof GenesysError && error.status === 404) recordings=[]; else throw error; }
-      return { ...summarize(c), recordingCount:recordings.length, recordings:recordings.map(recording=>safeRecording(recording,c)) };
+      } catch (error) { if(error instanceof GenesysError && (error.status === 404 || error.status === 403)){recordingListAvailable=false;recordings=[];} else throw error; }
+      return { ...summarize(c), recordingCount:recordings.length, recordingListAvailable, recordings:recordings.map(recording=>safeRecording(recording,c)) };
     });
-    const visibleResults=input.includeNoRecording?enriched:enriched.filter(result=>result.recordingCount>0);
-    if(!client)totalHits=visibleResults.length;
-    else if(!input.includeNoRecording){totalHits=null;partial=true;}
-    audit(req,'SEARCH','SUCCESS',connection?.id || 'mock',undefined,undefined,{page:input.pageNumber,includeNoRecording:input.includeNoRecording});
-    const scopeNote=!input.includeNoRecording?'Only conversations with at least one voice recording are shown; filtering is applied to the current Genesys page, so use Include no recording to see every conversation.':input.phone||input.dnis?'Genesys page filtered by ANI/DNIS after retrieval; this is not a complete phone search.':'Native Genesys detail query; result count depends on API response/permissions.';
-    res.json({ results:visibleResults, page:input.pageNumber,pageSize:input.pageSize,totalHits,partial:partial||(!input.includeNoRecording&&Boolean(client)),scope:scopeNote, mock:!client });
+    const recordingListsIncomplete=enriched.some(result=>!result.recordingListAvailable);
+    partial||=recordingListsIncomplete;
+    const matchesRecordingFilter=(result:any)=>input.includeNoRecording||result.recordingCount>0;
+    const visibleResults=enriched.filter(result=>matchesRecordingFilter(result)&&(!input.phone||result.ani.includes(input.phone))&&(!input.dnis||result.dnis.includes(input.dnis)));
+    totalHits=partial?null:visibleResults.length;
+    const pageStart=(input.pageNumber-1)*input.pageSize;
+    const pageResults=visibleResults.slice(pageStart,pageStart+input.pageSize);
+    audit(req,'SEARCH','SUCCESS',connection?.id || 'mock',undefined,undefined,{page:input.pageNumber,includeNoRecording:input.includeNoRecording,conversationsScanned:conversations.length,recordingsFound:visibleResults.reduce((count,result)=>count+result.recordingCount,0),partial});
+    const scopeNote=recordingListsIncomplete?'Genesys did not return recording lists for some conversations (404 or permission denied). Results may be incomplete; verify permissions and retry.':partial?'Results were capped at 1,000 conversations or an Analytics page could not be verified; narrow the time range to confirm completeness.':input.phone||input.dnis?'Every conversation in the time range was checked before ANI/DNIS filters were applied.':!input.includeNoRecording?'Every conversation in the selected time range was checked; only those with at least one Genesys voice recording are shown.':'Every conversation in the selected time range was checked; conversations without voice recordings are included.';
+    res.json({ results:pageResults, page:input.pageNumber,pageSize:input.pageSize,totalHits,partial,scope:scopeNote, mock:!client });
   } catch(error) { audit(req,'SEARCH','FAILED'); next(error); }
 });
 app.get('/api/recordings/conversations/:conversationId', requireAuth, async (req,res,next) => {
   try { const conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.');if(String(req.query.connectionId||'')==='mock'&&process.env.MOCK_MODE==='true'){const mock=MOCK_CONVERSATIONS.find(item=>item.conversationId===conversationId);return mock?res.json({...mock,wrapUpNotes:collectAfterCallNotes(mock)}):res.status(404).json({error:'Conversation not found.'});}const connection = connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role); const client = new GenesysClient(connection); const conversation = await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`); const mapped=await mapWrapUpNames(client,conversation); audit(req,'DETAILS_VIEW','SUCCESS',connection.id,conversationId); res.json({...redactSensitiveMetadata(mapped),wrapUpNotes:collectAfterCallNotes(mapped)}); }
   catch(error) { next(error); }
 });
-app.get('/api/recordings/conversations/:conversationId/recordings', requireAuth, async (req,res,next) => {
-  try { const id=String(req.query.connectionId||''),conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.'); if(id==='mock'&&process.env.MOCK_MODE==='true') { const conversation=MOCK_CONVERSATIONS.find(item=>item.conversationId===conversationId);return res.json(((MOCK_RECORDINGS[conversationId]||[]) as any[]).filter(recording=>isVoiceRecording(recording,conversation)).map(recording=>safeRecording(recording,conversation))); } const c=connectionById(id,req.session.user!.id,req.session.user!.role),client=new GenesysClient(c); const items=await client.get<any[]>(`/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings`); const needsConversationContext=items.some(recording=>typeof recording?.mediaType!=='string');const conversation=needsConversationContext?await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`):undefined; res.json(items.filter(recording=>isVoiceRecording(recording,conversation)).map(recording=>safeRecording(recording,conversation))); }
+ app.get('/api/recordings/conversations/:conversationId/recordings', requireAuth, async (req,res,next) => {
+   try { const id=String(req.query.connectionId||''),conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.'); if(id==='mock'&&process.env.MOCK_MODE==='true') { const conversation=MOCK_CONVERSATIONS.find(item=>item.conversationId===conversationId);return res.json(((MOCK_RECORDINGS[conversationId]||[]) as any[]).filter(recording=>isVoiceRecording(recording,conversation)).map(recording=>safeRecording(recording,conversation))); } const c=connectionById(id,req.session.user!.id,req.session.user!.role),client=new GenesysClient(c); const items=await client.get<any[]>(`/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings`); const needsConversationContext=items.some(recording=>typeof recording?.mediaType!=='string');const conversation=needsConversationContext?await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`):undefined;const voiceRecordings=items.filter(recording=>isVoiceRecording(recording,conversation));const enriched=await mapWithConcurrency(voiceRecordings,4,async recording=>{const recordingId=recording.id||recording.recordingId;if(!recordingId)return safeRecording(recording,conversation);try{const metadata=await client.get<any>(recordingMediaRequestPath(conversationId,recordingId));return safeRecording({...recording,...metadata},conversation);}catch{return safeRecording(recording,conversation);}});res.json(enriched); }
   catch(error) { next(error); }
 });
 app.get('/api/recordings/:recordingId/metadata', requireAuth, async (req,res,next) => {
@@ -617,7 +641,7 @@ function validateMediaUrl(value:string,connection:Connection){try{return validat
 async function pipeMedia(_req:Request,res:ExpressResponse,response:globalThis.Response,options:{allowZip?:boolean}={}){if(!response.ok&&response.status!==206){throw httpError(response.status===403?410:502,response.status===403?'Recording media URL has expired. Retry playback to obtain a fresh URL.':'Recording media could not be retrieved.');}const type=response.headers.get('content-type')||'';if(isZipMediaContentType(type)&&!options.allowZip){await response.body?.cancel().catch(()=>{});throw httpError(409,'Genesys returned a ZIP message recording archive, not playable audio. This recording cannot play in the audio player; use Download to retrieve the archive.');}if(!/^audio\//i.test(type)&&!/^video\/webm/i.test(type)&&!/^application\/octet-stream/i.test(type)&&!(options.allowZip&&isZipMediaContentType(type)))throw httpError(502,'Genesys returned an unsupported media content type.');res.status(response.status);res.setHeader('Content-Type',type);res.setHeader('Cache-Control','private, no-store, no-cache, must-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Accept-Ranges',response.headers.get('accept-ranges')||'bytes');const length=response.headers.get('content-length'),range=response.headers.get('content-range');if(length)res.setHeader('Content-Length',length);if(range)res.setHeader('Content-Range',range);if(!response.body)throw httpError(502,'Recording media response was empty.');const stream=Readable.fromWeb(response.body as import('node:stream/web').ReadableStream);const onClose=()=>{if(!res.writableEnded)stream.destroy(new Error('Downstream playback client disconnected.'));};res.once('close',onClose);try{await new Promise<void>((resolve,reject)=>{stream.once('error',reject);res.once('error',reject);res.once('finish',resolve);stream.pipe(res);});}finally{res.off('close',onClose);}}
 async function readBoundedBody(response:globalThis.Response,limit:number):Promise<Buffer>{if(!response.ok){await response.body?.cancel().catch(()=>{});throw httpError(response.status===403?410:502,'Recording media could not be retrieved.');}const declared=Number(response.headers.get('content-length')||0);if(declared>limit){await response.body?.cancel().catch(()=>{});throw httpError(413,'Recording ZIP archive exceeds the safe playback size limit.');}if(!response.body)throw httpError(502,'Recording media response was empty.');const reader=response.body.getReader(),chunks:Buffer[]=[];let total=0;try{while(true){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>limit){await reader.cancel();throw httpError(413,'Recording ZIP archive exceeds the safe playback size limit.');}chunks.push(Buffer.from(value));}}finally{reader.releaseLock();}return Buffer.concat(chunks,total);}
 function serveAudioBuffer(req:Request,res:ExpressResponse,audio:Buffer,mimeType:string){const match=/^bytes=(\d*)-(\d*)$/.exec(req.headers.range||'');let start=0,end=audio.length-1;if(match){if(!match[1]&&!match[2])throw httpError(416,'Requested audio range is invalid.');if(!match[1]){const suffix=Number(match[2]);if(!Number.isSafeInteger(suffix)||suffix<=0)throw httpError(416,'Requested audio range is invalid.');start=Math.max(0,audio.length-suffix);}else{start=Number(match[1]);if(match[2])end=Number(match[2]);}if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||start>=audio.length||end<start){res.status(416).setHeader('Content-Range',`bytes */${audio.length}`).end();return;}end=Math.min(end,audio.length-1);}res.status(match?206:200);res.setHeader('Content-Type',mimeType);res.setHeader('Content-Length',String(end-start+1));res.setHeader('Accept-Ranges','bytes');if(match)res.setHeader('Content-Range',`bytes ${start}-${end}/${audio.length}`);res.setHeader('Cache-Control','private, no-store, no-cache, must-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('X-Content-Type-Options','nosniff');res.end(audio.subarray(start,end+1));}
-function safeRecording(r:any,conversation?:any){const mediaUris=r.mediaUris,mediaUriAvailable=(Array.isArray(mediaUris)&&mediaUris.some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||(mediaUris&&typeof mediaUris==='object'&&!Array.isArray(mediaUris)&&Object.values(mediaUris).some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||typeof r.mediaUri==='string'&&r.mediaUri,hasMedia=Boolean(mediaUriAvailable||(process.env.MOCK_MODE!=='true'&&(r.id||r.recordingId))),mediaType=r.mediaType||(r.media==='audio'&&conversationHasVoiceSession(conversation)?'voice':undefined);return {id:r.id||r.recordingId,startTime:r.startTime||r.recordingStartTime,endTime:r.endTime||r.recordingEndTime,status:r.status||r.recordingState||'UNKNOWN',media:r.media,mediaType,durationMs:r.durationMs,hasMedia};}
+function safeRecording(r:any,conversation?:any){const mediaUris=r.mediaUris,mediaUriAvailable=(Array.isArray(mediaUris)&&mediaUris.some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||(mediaUris&&typeof mediaUris==='object'&&!Array.isArray(mediaUris)&&Object.values(mediaUris).some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||typeof r.mediaUri==='string'&&r.mediaUri,mediaType=r.mediaType||(r.media==='audio'&&conversationHasVoiceSession(conversation)?'voice':undefined);return {id:r.id||r.recordingId,startTime:r.startTime||r.recordingStartTime,endTime:r.endTime||r.recordingEndTime,status:r.status||r.recordingState||r.fileState||'UNKNOWN',media:r.media,mediaType,durationMs:r.durationMs||r.outputDurationMs,hasMedia:Boolean(mediaUriAvailable)};}
 async function fetchTrustedMedia(value:string,connection:Connection,headers:Record<string,string>){let url=validateMediaUrl(value,connection);for(let redirects=0;redirects<=2;redirects++){let response:globalThis.Response;try{response=await fetch(url,{headers,signal:AbortSignal.timeout(30000),redirect:'manual'});}catch{throw httpError(502,'Recording media could not be reached. Retry playback.');}if(response.status<300||response.status>=400)return response;const location=response.headers.get('location');if(!location)throw httpError(502,'Recording media redirect was invalid.');if(redirects===2)throw httpError(502,'Recording media returned too many redirects.');let next:URL;try{next=new URL(location,url);}catch{throw httpError(502,'Recording media redirect was invalid.');}url=validateMediaUrl(next.toString(),connection);}throw httpError(502,'Recording media redirect was invalid.');}
 async function mapWithConcurrency<T,R>(items:T[],limit:number,work:(item:T)=>Promise<R>):Promise<R[]>{const output=new Array<R>(items.length);let cursor=0;async function worker(){while(true){const index=cursor++;if(index>=items.length)return;output[index]=await work(items[index]);}}await Promise.all(Array.from({length:Math.min(limit,items.length)},worker));return output;}
 function rejectCrossOrigin(req:Request,res:ExpressResponse,next:NextFunction){const origin=req.get('origin'),fetchSite=req.get('sec-fetch-site');if(fetchSite==='cross-site')return res.status(403).json({error:'Cross-site API requests are not allowed.'});if(origin){try{const expected=new URL(process.env.APP_ORIGIN||'http://localhost:5173').origin;if(new URL(origin).origin!==expected)return res.status(403).json({error:'Request origin is not allowed.'});}catch{return res.status(403).json({error:'Request origin is not allowed.'});}}next();}

@@ -287,11 +287,31 @@ describe('HTTP API security and Mock Mode flows', () => {
   });
 
   it('limits the analytics interval and labels synthetic metadata as non-playable', async () => {
-    const tooWide = await request('/api/recordings/search', {
+    const longRange = await request('/api/recordings/search', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-11-01T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', pageNumber: 1, pageSize: 25 }),
     }, true);
+    expect(longRange.status).toBe(200);
+    const tooWide = await request('/api/recordings/search', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-06-01T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', pageNumber: 1, pageSize: 25 }),
+    }, true);
     expect(tooWide.status).toBe(400);
+    const recordingSearch = await request('/api/recordings/search', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-11-14T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', pageNumber: 2, pageSize: 1 }),
+    }, true);
+    expect(recordingSearch.status).toBe(200);
+    const recordingPage = await recordingSearch.json() as { results: { conversationId: string }[]; totalHits: number };
+    expect(recordingPage.results.map(result => result.conversationId)).toEqual(['demo-ava-agent-001']);
+    expect(recordingPage.totalHits).toBe(3);
+    const filteredPage = await request('/api/recordings/search', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ connectionId: 'mock', intervalStart: '2026-11-14T00:00:00.000Z', intervalEnd: '2026-11-17T00:00:00.000Z', pageNumber: 1, pageSize: 1, direction: 'inbound' }),
+    }, true);
+    const filteredResults = await filteredPage.json() as { results: { conversationId: string }[]; totalHits: number };
+    expect(filteredResults.results.map(result => result.conversationId)).toEqual(['demo-bot-only-002']);
+    expect(filteredResults.totalHits).toBe(2);
     const stream = await request('/api/recordings/demo-recording-1/stream?connectionId=mock&conversationId=demo-ava-agent-001');
     expect(stream.status).toBe(501);
     expect((await stream.json() as { error: string }).error).toMatch(/metadata only/i);
