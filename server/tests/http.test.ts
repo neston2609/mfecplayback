@@ -3,6 +3,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import Database from 'better-sqlite3';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const root = process.cwd();
@@ -365,6 +366,77 @@ describe('HTTP API security and Mock Mode flows', () => {
     const selfDelete = await request(`/api/admin/users/${admin!.id}`, { method: 'DELETE' }, true);
     expect(selfDelete.status).toBe(400);
   });
+
+  it('supports profile updates, the eight-character policy, role-guarded resets, and encrypted SMTP settings', async () => {
+    const createdResponse=await request('/api/admin/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'policy-user',password:'InitialA1',role:'viewer',connectionIds:[],profile:{email:'policy@example.com',phone:'+66 81 234 5678',firstName:'Policy',lastName:'User',nickname:'Test',jobTitle:'Analyst',division:'Operations',department:'Quality'}})},true);
+    expect(createdResponse.status,await createdResponse.clone().text()).toBe(201);
+    const created=await createdResponse.json() as {id:string};
+    const profileList=await request('/api/admin/users');
+    expect((await profileList.json() as {users:Record<string,unknown>[]}).users.find(item=>item.id===created.id)).toMatchObject({email:'policy@example.com',phone:'+66 81 234 5678',firstName:'Policy',lastName:'User',nickname:'Test',jobTitle:'Analyst',division:'Operations',department:'Quality'});
+
+    const login=await fetch(`${baseUrl}/api/auth/login`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'policy-user',password:'InitialA1'})});
+    expect(login.status).toBe(200);
+    const userCookie=(login.headers.get('set-cookie')||'').split(';',1)[0];
+    const userCsrf=(await login.json() as {csrfToken:string}).csrfToken;
+    const headers={'content-type':'application/json',cookie:userCookie,'x-csrf-token':userCsrf,Origin:'http://localhost:5173'};
+    const userProfile=await fetch(`${baseUrl}/api/user/profile`,{headers:{cookie:userCookie}});
+    expect(await userProfile.json()).toMatchObject({profile:{email:'policy@example.com',firstName:'Policy'}});
+    const profileUpdate=await fetch(`${baseUrl}/api/user/profile`,{method:'PUT',headers,body:JSON.stringify({email:'updated@example.com',phone:'+66 99 000 0000',firstName:'Updated',lastName:'User',nickname:'Update',jobTitle:'Lead',division:'Service',department:'CX'})});
+    expect(profileUpdate.status).toBe(200);
+    const deniedReset=await fetch(`${baseUrl}/api/admin/users/${created.id}/password`,{method:'POST',headers,body:JSON.stringify({password:'ResetPass9'})});
+    expect(deniedReset.status).toBe(403);
+    const smtpDenied=await fetch(`${baseUrl}/api/admin/smtp`,{headers:{cookie:userCookie}});
+    expect(smtpDenied.status).toBe(403);
+    const userPasswordUpdate=await fetch(`${baseUrl}/api/auth/password`,{method:'POST',headers,body:JSON.stringify({currentPassword:'InitialA1',newPassword:'Changed!9'})});
+    expect(userPasswordUpdate.status).toBe(200);
+    const refreshedAuth=await userPasswordUpdate.json() as {csrfToken:string};
+
+    const badPolicy=await request(`/api/admin/users/${created.id}/password`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:'12345678'})},true);
+    expect(badPolicy.status).toBe(400);
+    const reset=await request(`/api/admin/users/${created.id}/password`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:'ResetPass9'})},true);
+    expect(reset.status).toBe(200);
+    const revoked=await fetch(`${baseUrl}/api/auth/me`,{headers:{cookie:userCookie}});
+    expect(revoked.status).toBe(401);
+    const resetLogin=await fetch(`${baseUrl}/api/auth/login`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'policy-user',password:'ResetPass9'})});
+    expect(resetLogin.status).toBe(200);
+
+    const smtpInitial=await request('/api/admin/smtp');
+    expect(await smtpInitial.json()).toMatchObject({settings:{host:'smtp.gmail.com',port:587,secure:false,passwordConfigured:false}});
+    const smtpTestWithoutCredentials=await request('/api/admin/smtp/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({to:'qa@example.com'})},true);
+    expect(smtpTestWithoutCredentials.status).toBe(409);
+    const smtpSave=await request('/api/admin/smtp',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({host:'smtp.gmail.com',port:587,secure:false,username:'sender@gmail.com',password:'secret-gmail-app-password',fromName:'MFEC',fromEmail:'sender@gmail.com',rejectUnauthorized:true})},true);
+    expect(smtpSave.status).toBe(200);
+    const savedBody=await smtpSave.json() as {settings:Record<string,unknown>};
+    expect(savedBody.settings).toMatchObject({host:'smtp.gmail.com',port:587,passwordConfigured:true});
+    expect(savedBody).not.toHaveProperty('password');
+    expect(JSON.stringify(savedBody)).not.toContain('secret-gmail-app-password');
+    const smtpAfterSave=await request('/api/admin/smtp');
+    const smtpAfterBody=await smtpAfterSave.json() as {settings:Record<string,unknown>};
+    expect(smtpAfterBody.settings.passwordConfigured).toBe(true);
+    expect(JSON.stringify(smtpAfterBody)).not.toContain('secret-gmail-app-password');
+    const persisted=new Database(path.join(testDirectory,'integration.sqlite'),{readonly:true});
+    const storedSmtp=persisted.prepare("SELECT value_json FROM application_settings WHERE key='smtp_settings'").get() as {value_json:string};
+    expect(storedSmtp.value_json).not.toContain('secret-gmail-app-password');
+    expect(JSON.parse(storedSmtp.value_json)).toHaveProperty('passwordEnc');
+    persisted.close();
+    const clearPassword=await request('/api/admin/smtp',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({host:'smtp.gmail.com',port:587,secure:false,username:'sender@gmail.com',password:'',fromName:'MFEC',fromEmail:'sender@gmail.com',rejectUnauthorized:true})},true);
+    expect(clearPassword.status).toBe(200);
+    const retainedSecret=await request('/api/admin/smtp');
+    expect((await retainedSecret.json() as {settings:{passwordConfigured:boolean}}).settings.passwordConfigured).toBe(true);
+
+    const adminRows=await request('/api/admin/users');
+    const currentAdmin=(await adminRows.json() as {users:{id:string;username:string}[]}).users.find(entry=>entry.username==='integration-admin')!;
+    const selfReset=await request(`/api/admin/users/${currentAdmin.id}/password`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:'SelfReset9'})},true);
+    expect(selfReset.status).toBe(400);
+    expect(refreshedAuth.csrfToken).toEqual(expect.any(String));
+    const deleteUser=await request(`/api/admin/users/${created.id}`,{method:'DELETE'},true);
+    expect(deleteUser.status).toBe(204);
+    const bootstrapDatabase=new Database(path.join(testDirectory,'integration.sqlite'),{readonly:true});
+    expect(bootstrapDatabase.prepare('PRAGMA table_info(users)').all()).toEqual(expect.arrayContaining([
+      expect.objectContaining({name:'email'}),expect.objectContaining({name:'phone'}),expect.objectContaining({name:'first_name'}),expect.objectContaining({name:'last_name'}),expect.objectContaining({name:'nickname'}),expect.objectContaining({name:'job_title'}),expect.objectContaining({name:'division'}),expect.objectContaining({name:'department'}),
+    ]));
+    bootstrapDatabase.close();
+  }, 30_000);
 
   it('requires a current password and a strong new password for credential changes', async () => {
     const weak = await request('/api/auth/password', {

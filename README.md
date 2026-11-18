@@ -4,7 +4,7 @@ Standalone MFEC-branded Genesys Cloud CX recording search application. It is sep
 
 ## Current delivery
 
-This project includes a React + TypeScript frontend, Express 5 backend, SQLite schema, server-side session authentication, role/access checks, same-origin and CSRF validation, login/API rate limiting, AES-256-GCM credential encryption, region allowlisting, OAuth Client Credentials, bounded Genesys conversation-detail queries, per-conversation recording discovery, authenticated media streaming/download proxy, audit events, password changes, and explicit synthetic Mock Mode. The delivered single-instance target is Ubuntu with SQLite and one trusted Nginx TLS proxy. Multi-instance/PostgreSQL is not delivered.
+This project includes a React + TypeScript frontend, Express 5 backend, SQLite schema, server-side session authentication, role/access checks, same-origin and CSRF validation, login/API rate limiting, AES-256-GCM credential encryption, region allowlisting, OAuth Client Credentials, bounded Genesys conversation-detail queries, per-conversation recording discovery, authenticated media streaming/download proxy, audit events, password changes, user profile management, encrypted SMTP configuration, and explicit synthetic Mock Mode. The delivered single-instance target is Ubuntu with SQLite and one trusted Nginx TLS proxy. Multi-instance/PostgreSQL is not delivered.
 
 Mock Mode shows three synthetic conversations (bot to agent, bot only, and multi-agent) with recording metadata. Synthetic recordings do not contain real audio. It is not a simulation of successful live playback.
 
@@ -33,7 +33,9 @@ Set `MOCK_MODE=true` to explore synthetic fixtures without Genesys credentials. 
 npm run dev
 ```
 
-Open <http://localhost:5173>. The initial administrator is created only when the database has no users and both `INITIAL_ADMIN_USERNAME` and `INITIAL_ADMIN_PASSWORD` are set. Production startup fails closed if no bootstrap account is supplied for an empty database; after creation the bootstrap password is removed from the process environment. Change the generated credential after first sign-in using **Settings → Change password**. Runtime SQLite files are written under `runtime/`.
+Open <http://localhost:5173>. The initial administrator is created only when the database has no users and both `INITIAL_ADMIN_USERNAME` and `INITIAL_ADMIN_PASSWORD` are set. New passwords require at least eight characters, one letter (either case), and one number or special character; profile/password screens show live checks including confirmation. Production startup fails closed if no bootstrap account is supplied for an empty database; after creation the bootstrap password is removed from the process environment. Change the generated credential after first sign-in using **Settings → Change password**. Runtime SQLite files are written under `runtime/`.
+
+Administrators manage account roles, profiles, password resets and organization grants under **Users & Access**. Users can update their own profile and password in **Settings**. SMTP uses **Settings → SMTP email delivery**; Gmail defaults are `smtp.gmail.com`, port 587 with STARTTLS. Enter the real Gmail account and its App Password (not the Gmail web-login password). SMTP secrets use the server's AES-256-GCM key and are never returned to the browser. A test-email action verifies the configured transport.
 
 ## Live Genesys setup
 
@@ -65,6 +67,12 @@ npm run db:migrate   # Apply idempotent SQLite schema
 | POST | `/api/auth/logout` | CSRF-protected logout |
 | POST | `/api/auth/password` | Change own password and revoke existing sessions |
 | GET | `/api/auth/me` | Current user and CSRF token |
+| GET/PUT | `/api/user/profile` | Read/update the signed-in user's profile |
+| GET/PUT | `/api/admin/users` | List/create users (administrator-only) |
+| PUT | `/api/admin/users/:id/profile` | Administrator updates a user profile |
+| POST | `/api/admin/users/:id/password` | Administrator resets a user's password and revokes their sessions |
+| GET/PUT | `/api/admin/smtp` | Read safe SMTP status/save encrypted SMTP settings (administrator-only) |
+| POST | `/api/admin/smtp/test` | Send an administrator-requested test email |
 | GET | `/api/genesys/regions` | Trusted region catalogue |
 | GET/POST | `/api/genesys/connections` | List/create connections (create is admin-only) |
 | PUT/DELETE | `/api/genesys/connections/:id` | Admin connection change/removal |

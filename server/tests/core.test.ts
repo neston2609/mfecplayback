@@ -8,10 +8,32 @@ import { getRecordingMedia, isMessageRecording, isZipMediaContentType, recording
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from '../wrapup.js';
+import { checkPasswordPolicy, isPasswordPolicySatisfied } from '../password-policy.js';
+import { parseSmtpSettings, publicSmtpSettings } from '../mailer.js';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
   afterAll(() => { delete process.env.MASTER_ENCRYPTION_KEY; });
+
+  it('enforces the requested eight-character password rules without requiring both cases', () => {
+    expect(checkPasswordPolicy('abcdefgh','abcdefgh')).toEqual({minLength:true,hasLetter:true,hasNumberOrSpecial:false,matchesConfirmation:true});
+    expect(isPasswordPolicySatisfied('abcdefgh1')).toBe(true);
+    expect(isPasswordPolicySatisfied('ABCDEFGH!')).toBe(true);
+    expect(isPasswordPolicySatisfied('éééééééé!')).toBe(true);
+    expect(isPasswordPolicySatisfied('กขคงจฉช้')).toBe(false);
+    expect(isPasswordPolicySatisfied('short1')).toBe(false);
+    expect(isPasswordPolicySatisfied('12345678')).toBe(false);
+    expect(checkPasswordPolicy('abcdefgh1','abcdefgh2').matchesConfirmation).toBe(false);
+  });
+
+  it('validates Gmail SMTP settings and never returns configured passwords', () => {
+    const settings=parseSmtpSettings({host:'smtp.gmail.com',port:587,secure:false,username:'sender@gmail.com',password:'gmail-app-password',fromName:'MFEC',fromEmail:'sender@gmail.com',rejectUnauthorized:true});
+    expect(settings).toMatchObject({host:'smtp.gmail.com',port:587,secure:false});
+    expect(publicSmtpSettings(settings,true)).toMatchObject({passwordConfigured:true,username:'sender@gmail.com'});
+    expect(publicSmtpSettings(settings,true)).not.toHaveProperty('password');
+    expect(()=>parseSmtpSettings({...settings,port:70000})).toThrow(/port/i);
+    expect(()=>parseSmtpSettings({...settings,host:'smtp.gmail.com',rejectUnauthorized:false})).toThrow(/certificate/i);
+  });
 
   it('provides official common Genesys regions including Singapore and Tokyo', () => {
     expect(DEFAULT_REGIONS.find(region => region.id === 'ap-southeast-1')).toMatchObject({ api: 'https://api.apse1.pure.cloud', oauth: 'https://login.apse1.pure.cloud' });

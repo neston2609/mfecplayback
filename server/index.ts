@@ -14,7 +14,9 @@ import { db, migrate } from './db/index.js';
 import { clearUserAppearance, getDefaultAppearance, getUserAppearance, parseAppearance, saveDefaultAppearance, saveUserAppearance } from './appearance.js';
 import { getRecordingMedia, isMessageRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from './recording-media.js';
 import { BetterSqliteSessionStore } from './session-store.js';
-import { encrypt, safeEqual } from './security.js';
+import { decrypt, encrypt, safeEqual } from './security.js';
+import { isPasswordPolicySatisfied } from './password-policy.js';
+import { parseSmtpSettings, publicSmtpSettings, sendConfiguredEmail, type SmtpSettings } from './mailer.js';
 import { getRegions, saveRegions, trustedBaseUrl, validateRegionEndpoints, type GenesysRegion } from './regions.js';
 import { connectionById, type Connection } from './genesys.js';
 import { GenesysClient, GenesysError, verifyGenesysApiAccess } from './genesys-client.js';
@@ -105,6 +107,19 @@ app.delete('/api/user/appearance', requireAuth, requireCsrf, (req, res, next) =>
     res.json({ appearance: getDefaultAppearance(), userOverride: false, defaultAppearance: getDefaultAppearance(), canSetDefault: req.session.user!.role === 'administrator' });
   } catch (error) { next(error); }
 });
+app.get('/api/user/profile', requireAuth, (req, res) => {
+  const profile = db.prepare('SELECT email,phone,first_name AS firstName,last_name AS lastName,nickname,job_title AS jobTitle,division,department FROM users WHERE id=?').get(req.session.user!.id);
+  res.json({ profile });
+});
+app.put('/api/user/profile', requireAuth, requireCsrf, (req, res, next) => {
+  try {
+    const profile = profileSchema.parse(req.body);
+    db.prepare('UPDATE users SET email=?,phone=?,first_name=?,last_name=?,nickname=?,job_title=?,division=?,department=? WHERE id=?')
+      .run(profile.email,profile.phone,profile.firstName,profile.lastName,profile.nickname,profile.jobTitle,profile.division,profile.department,req.session.user!.id);
+    audit(req,'USER_PROFILE_UPDATE','SUCCESS');
+    res.json({ profile });
+  } catch (error) { next(error); }
+});
 app.post('/api/auth/login', loginLimiter, async (req, res, next) => {
   try {
     const input = z.object({ username: z.string().min(1).max(128), password: z.string().min(1).max(1024) }).parse(req.body);
@@ -124,7 +139,8 @@ app.post('/api/auth/logout', requireAuth, requireCsrf, (req, res) => {
 });
 app.post('/api/auth/password', requireAuth, requireCsrf, async (req, res, next) => {
   try {
-    const input = z.object({ currentPassword: z.string().min(1).max(1024), newPassword: z.string().min(14).max(256) }).parse(req.body);
+    const input = z.object({ currentPassword: z.string().min(1).max(1024), newPassword: z.string().min(8).max(256) }).parse(req.body);
+    if (!isPasswordPolicySatisfied(input.newPassword)) throw httpError(400, 'Password must be at least 8 characters and include a letter plus a number or special character.');
     const user = db.prepare('SELECT password_hash FROM users WHERE id=? AND enabled=1').get(req.session.user!.id) as { password_hash: string } | undefined;
     if (!user || !(await bcrypt.compare(input.currentPassword, user.password_hash))) throw httpError(401, 'Current password is incorrect.');
     const newHash = await bcrypt.hash(input.newPassword, 12);
@@ -285,15 +301,54 @@ app.get('/api/genesys/connections/:id/permissions', requireAuth, requireAdmin, (
   try { if(process.env.MOCK_MODE==='true')throw httpError(409,'Mock Mode is active. No live Genesys permissions are configured.');connectionById(String(req.params.id),req.session.user!.id,req.session.user!.role); res.json({ permissions:[{ name:'analytics:conversationDetail:view', purpose:'Search conversation details'},{name:'recording:recording:view', purpose:'Discover and play recordings'}], verified:false, note:'Permission availability must be verified against the configured Genesys organization; this screen does not infer delegated user permissions.' }); }
   catch(error) { next(error); }
 });
+app.get('/api/admin/smtp',requireAuth,requireAdmin,(req,res,next)=>{
+  try { const stored=getStoredSmtpSettings();res.json({settings:publicSmtpSettings(stored.settings,stored.passwordConfigured)}); }
+  catch(error){next(error);}
+});
+app.put('/api/admin/smtp',requireAuth,requireAdmin,requireCsrf,(req,res,next)=>{
+  try {
+    const passwordInput=typeof req.body?.password==='string'?req.body.password:'';
+    const previous=getStoredSmtpSettings();
+    const candidate={...req.body,password:passwordInput||previous.settings.password};
+    let settings:SmtpSettings;
+    try{settings=parseSmtpSettings(candidate);}catch(error){if(!passwordInput&&!previous.passwordConfigured)throw httpError(400,'Enter the SMTP password or app password before saving.');throw httpError(400,error instanceof Error?error.message:'SMTP settings are invalid.');}
+    if(!settings.password)throw httpError(400,'Enter the SMTP password or app password before saving.');
+    const value={...settings,passwordEnc:encrypt(settings.password)};
+    delete (value as Partial<typeof value>).password;
+    db.prepare("INSERT INTO application_settings(key,value_json) VALUES('smtp_settings',?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json").run(JSON.stringify(value));
+    audit(req,'SMTP_SETTINGS_UPDATE','SUCCESS');
+    res.json({settings:publicSmtpSettings(settings,true)});
+  } catch(error){next(error);}
+});
+app.post('/api/admin/smtp/test',requireAuth,requireAdmin,requireCsrf,async(req,res,next)=>{
+  try {
+    const stored=getStoredSmtpSettings();
+    if(!stored.passwordConfigured)throw httpError(409,'Save SMTP credentials before sending a test email.');
+    const recipient=z.string().trim().email().max(320).parse(req.body?.to);
+    let info;
+    try{info=await sendConfiguredEmail(stored.settings,{to:recipient,subject:'MFEC Recording Explorer SMTP test',text:'This is a test email confirming that the configured SMTP server can send mail.'});}
+    catch{throw httpError(502,'SMTP test email could not be sent. Verify the host, port, TLS settings, credentials, and server outbound mail access.');}
+    audit(req,'SMTP_TEST_EMAIL','SUCCESS',undefined,undefined,undefined,{recipient});
+    res.json({ok:true,messageId:info.messageId});
+  } catch(error){audit(req,'SMTP_TEST_EMAIL','FAILED');next(error);}
+});
 app.get('/api/admin/users',requireAuth,requireAdmin,(req,res)=>{
-  const users=db.prepare('SELECT id,username,role,enabled,created_at AS createdAt FROM users ORDER BY username').all() as {id:string;username:string;role:string;enabled:number;createdAt:string}[];
+  const users=db.prepare('SELECT id,username,role,enabled,created_at AS createdAt,email,phone,first_name AS firstName,last_name AS lastName,nickname,job_title AS jobTitle,division,department FROM users ORDER BY username').all() as {id:string;username:string;role:string;enabled:number;createdAt:string}[];
   const grants=db.prepare('SELECT user_id AS userId,connection_id AS connectionId FROM user_connection_access').all() as {userId:string;connectionId:string}[];
   res.json({users:users.map(user=>({...user,connections:grants.filter(grant=>grant.userId===user.id).map(grant=>grant.connectionId)}))});
 });
 app.post('/api/admin/users',requireAuth,requireAdmin,requireCsrf,async(req,res,next)=>{
-  try { const input=z.object({username:z.string().trim().min(2).max(128).regex(/^[\p{L}\p{N}._@-]+$/u),password:z.string().min(14).max(256),role:z.enum(['administrator','supervisor','quality_analyst','viewer']),connectionIds:z.array(z.string()).max(100).default([])}).parse(req.body); for(const connectionId of input.connectionIds)if(!db.prepare('SELECT id FROM connections WHERE id=? AND enabled=1').get(connectionId))throw httpError(400,'An enabled organization connection is required.'); const id=crypto.randomUUID();
-    const transaction=db.transaction(()=>{db.prepare('INSERT INTO users(id,username,password_hash,role,created_at) VALUES(?,?,?,?,?)').run(id,input.username,awaitHash(input.password),input.role,new Date().toISOString());const grant=db.prepare('INSERT INTO user_connection_access(user_id,connection_id) VALUES(?,?)');for(const connectionId of input.connectionIds)grant.run(id,connectionId);}); transaction(); audit(req,'USER_CREATE','SUCCESS'); res.status(201).json({id,username:input.username});
+  try { const input=z.object({username:z.string().trim().min(2).max(128).regex(/^[\p{L}\p{N}._@-]+$/u),password:z.string().min(8).max(256),role:z.enum(['administrator','supervisor','quality_analyst','viewer']),connectionIds:z.array(z.string()).max(100).default([]),profile:profileSchema.default(emptyProfile)}).parse(req.body); if(!isPasswordPolicySatisfied(input.password))throw httpError(400,'Password must be at least 8 characters and include a letter plus a number or special character.');for(const connectionId of input.connectionIds)if(!db.prepare('SELECT id FROM connections WHERE id=? AND enabled=1').get(connectionId))throw httpError(400,'An enabled organization connection is required.'); const id=crypto.randomUUID();
+    const transaction=db.transaction(()=>{db.prepare('INSERT INTO users(id,username,password_hash,role,created_at,email,phone,first_name,last_name,nickname,job_title,division,department) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,input.username,awaitHash(input.password),input.role,new Date().toISOString(),input.profile.email,input.profile.phone,input.profile.firstName,input.profile.lastName,input.profile.nickname,input.profile.jobTitle,input.profile.division,input.profile.department);const grant=db.prepare('INSERT INTO user_connection_access(user_id,connection_id) VALUES(?,?)');for(const connectionId of input.connectionIds)grant.run(id,connectionId);}); transaction(); audit(req,'USER_CREATE','SUCCESS'); res.status(201).json({id,username:input.username});
   } catch(error){next(error);}
+});
+app.put('/api/admin/users/:id/profile',requireAuth,requireAdmin,requireCsrf,(req,res,next)=>{
+  try { const id=String(req.params.id),profile=profileSchema.parse(req.body);if(!db.prepare('SELECT id FROM users WHERE id=?').get(id))throw httpError(404,'User not found.');db.prepare('UPDATE users SET email=?,phone=?,first_name=?,last_name=?,nickname=?,job_title=?,division=?,department=? WHERE id=?').run(profile.email,profile.phone,profile.firstName,profile.lastName,profile.nickname,profile.jobTitle,profile.division,profile.department,id);audit(req,'USER_PROFILE_UPDATE','SUCCESS',undefined,undefined,undefined,{userId:id});res.json({profile}); }
+  catch(error){next(error);}
+});
+app.post('/api/admin/users/:id/password',requireAuth,requireAdmin,requireCsrf,async(req,res,next)=>{
+  try { const id=String(req.params.id),{password}=z.object({password:z.string().min(8).max(256)}).parse(req.body);if(id===req.session.user!.id)throw httpError(400,'Use Change password in Settings to update your own password.');if(!isPasswordPolicySatisfied(password))throw httpError(400,'Password must be at least 8 characters and include a letter plus a number or special character.');const target=db.prepare('SELECT id FROM users WHERE id=?').get(id);if(!target)throw httpError(404,'User not found.');const hash=await bcrypt.hash(password,12);db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash,id);revokeUserSessions(id);audit(req,'USER_PASSWORD_RESET','SUCCESS',undefined,undefined,undefined,{userId:id});res.json({ok:true}); }
+  catch(error){next(error);}
 });
 app.put('/api/admin/users/:id/access',requireAuth,requireAdmin,requireCsrf,(req,res,next)=>{
   try { const input=z.object({connectionIds:z.array(z.string()).max(100)}).parse(req.body),id=String(req.params.id);if(!db.prepare('SELECT id FROM users WHERE id=?').get(id))throw httpError(404,'User not found.');for(const connectionId of input.connectionIds)if(!db.prepare('SELECT id FROM connections WHERE id=? AND enabled=1').get(connectionId))throw httpError(400,'An enabled organization connection is required.');const transaction=db.transaction(()=>{db.prepare('DELETE FROM user_connection_access WHERE user_id=?').run(id);const insert=db.prepare('INSERT INTO user_connection_access(user_id,connection_id) VALUES(?,?)');for(const connectionId of input.connectionIds)insert.run(id,connectionId);});transaction();audit(req,'USER_ACCESS_UPDATE','SUCCESS',undefined,undefined,undefined,{userId:id,connectionCount:input.connectionIds.length});res.json({ok:true}); }
@@ -419,7 +474,7 @@ app.get('/api/recordings/:recordingId/stream', requireAuth, async (req,res,next)
     if(cId==='mock'&&process.env.MOCK_MODE==='true') return res.status(501).json({error:'Synthetic demo recordings include metadata only; real audio playback requires an authorized Genesys recording.'});
     const c=connectionById(cId,req.session.user!.id,req.session.user!.role); const client=new GenesysClient(c);
     const recordingId=String(req.params.recordingId); const playable=await getRecordingMedia(client,conversationId,recordingId);
-    if(!playable) throw httpError(409,'Genesys did not return a playable media URL after 8 attempts. The recording may still be processing, unavailable, or outside the service account’s recording access.');
+    if(!playable) throw httpError(409,'Genesys has not made playable media available yet. Confirm the recording is finalized and that the service account has permission to download recordings in the conversation’s division; then retry.');
     const uri=playable.mediaUri;
     const headers: Record<string,string>={}; if(req.headers.range) headers.Range=req.headers.range;
     let media=await fetchTrustedMedia(uri,c,headers);
@@ -440,7 +495,7 @@ app.get('/api/recordings/:recordingId/stream', requireAuth, async (req,res,next)
 });
 app.get('/api/recordings/:recordingId/download', requireAuth, requireRole('administrator','supervisor','quality_analyst'), async (req,res,next) => {
   let connection:Connection|undefined,conversationId='',recordingId='';
-   try { conversationId=String(req.query.conversationId||'');recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.');connection=connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role);const playable=await getRecordingMedia(new GenesysClient(connection),conversationId,recordingId);if(!playable)throw httpError(409,'Genesys did not return downloadable media after 8 attempts. The recording may still be processing or unavailable to the service account.');const response=await fetchTrustedMedia(playable.mediaUri,connection,{});const extension=isZipMediaContentType(response.headers.get('content-type'))?'.zip':'';res.setHeader('Content-Disposition',`attachment; filename="recording-${recordingId.replace(/[^a-zA-Z0-9_-]/g,'_')}${extension}"`);await pipeMedia(req,res,response,{allowZip:true});audit(req,'DOWNLOAD','SUCCESS',connection.id,conversationId,recordingId);}
+   try { conversationId=String(req.query.conversationId||'');recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.');connection=connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role);const playable=await getRecordingMedia(new GenesysClient(connection),conversationId,recordingId);if(!playable)throw httpError(409,'Genesys has not made downloadable media available yet. Confirm the recording is finalized and that the service account has permission to download recordings in the conversation’s division; then retry.');const response=await fetchTrustedMedia(playable.mediaUri,connection,{});const extension=isZipMediaContentType(response.headers.get('content-type'))?'.zip':'';res.setHeader('Content-Disposition',`attachment; filename="recording-${recordingId.replace(/[^a-zA-Z0-9_-]/g,'_')}${extension}"`);await pipeMedia(req,res,response,{allowZip:true});audit(req,'DOWNLOAD','SUCCESS',connection.id,conversationId,recordingId);}
   catch(error) { audit(req,'DOWNLOAD','FAILED',connection?.id,conversationId||undefined,recordingId||undefined);next(error); }
 });
 app.get('/api/dashboard/summary', requireAuth, async (req,res,next) => {
@@ -517,7 +572,7 @@ function bootstrapUser() {
   const username=process.env.INITIAL_ADMIN_USERNAME, password=process.env.INITIAL_ADMIN_PASSWORD;
   if(!db.prepare('SELECT 1 FROM users LIMIT 1').get()) {
     if(!username||!password) { if(process.env.NODE_ENV==='production') throw new Error('Set INITIAL_ADMIN_USERNAME and INITIAL_ADMIN_PASSWORD for first production startup.'); return; }
-    if(password.length<14) throw new Error('INITIAL_ADMIN_PASSWORD must be at least 14 characters.');
+    if(!isPasswordPolicySatisfied(password)) throw new Error('INITIAL_ADMIN_PASSWORD must be at least 8 characters and include a letter plus a number or special character.');
     const normalized=username.trim();if(!/^[\p{L}\p{N}._@-]{2,128}$/u.test(normalized))throw new Error('INITIAL_ADMIN_USERNAME contains unsupported characters.');
     db.prepare('INSERT INTO users(id,username,password_hash,role,created_at) VALUES(?,?,?,?,?)').run(crypto.randomUUID(),normalized,bcrypt.hashSync(password,12),'administrator',new Date().toISOString());
     console.warn(`Initial administrator "${username}" created. Change the password after first login.`);
@@ -525,6 +580,17 @@ function bootstrapUser() {
   delete process.env.INITIAL_ADMIN_PASSWORD;
 }
 function awaitHash(password:string){return bcrypt.hashSync(password,12);}
+const emptyProfile={email:'',phone:'',firstName:'',lastName:'',nickname:'',jobTitle:'',division:'',department:''};
+const profileSchema=z.object({email:z.string().trim().max(320).refine(value=>!value||/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value),'Enter a valid email address.'),phone:z.string().trim().max(40),firstName:z.string().trim().max(100),lastName:z.string().trim().max(100),nickname:z.string().trim().max(100),jobTitle:z.string().trim().max(120),division:z.string().trim().max(120),department:z.string().trim().max(120)});
+function getStoredSmtpSettings():{settings:SmtpSettings;passwordConfigured:boolean}{
+  const row=db.prepare("SELECT value_json FROM application_settings WHERE key='smtp_settings'").get() as {value_json:string}|undefined;
+  if(!row)return {settings:{host:'smtp.gmail.com',port:587,secure:false,username:'',password:'',fromName:'MFEC Recording Explorer',fromEmail:'',rejectUnauthorized:true},passwordConfigured:false};
+  const value=JSON.parse(row.value_json) as Record<string,unknown>;
+  const passwordEnc=typeof value.passwordEnc==='string'?value.passwordEnc:'';
+  const password=passwordEnc?decrypt(passwordEnc):'';
+  const {passwordEnc:_passwordEnc,...fields}=value;
+  return {settings:parseSmtpSettings({...fields,password}),passwordConfigured:Boolean(passwordEnc)};
+}
 const connectionSchema=z.object({name:z.string().trim().min(1).max(120),organizationLabel:z.string().trim().min(1).max(120),regionId:z.string().min(1).max(64),apiBaseUrl:z.string().url().optional(),oauthBaseUrl:z.string().url().optional(),clientId:z.string().trim().min(1).max(256),clientSecret:z.string().min(1).max(1024),enabled:z.boolean().default(true),isDefault:z.boolean().default(false)});
 const connectionTestSchema=connectionSchema.partial({clientSecret:true}).extend({clientSecret:z.string().max(1024).optional(),existingConnectionId:z.string().uuid().optional()});
 const searchSchema=z.object({connectionId:z.string().min(1),intervalStart:z.string().datetime({offset:true}),intervalEnd:z.string().datetime({offset:true}),pageNumber:z.number().int().min(1).default(1),pageSize:z.number().int().min(1).max(100).default(25),includeNoRecording:z.boolean().default(false),agentId:z.string().optional(),queueId:z.string().optional(),direction:z.enum(['inbound','outbound']).optional(),phone:z.string().max(80).optional(),dnis:z.string().max(80).optional(),conversationId:z.string().max(128).optional()});
