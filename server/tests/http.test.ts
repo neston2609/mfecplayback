@@ -289,6 +289,20 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect((await audit.json() as { logs: unknown[] }).logs.length).toBeGreaterThan(0);
   });
 
+  it('returns bounded dashboard metrics from explicitly synthetic fixture data', async () => {
+    const start='2026-11-14T00:00:00.000Z',end='2026-11-18T00:00:00.000Z';
+    const dashboard=await request(`/api/dashboard/summary?connectionId=mock&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
+    expect(dashboard.status).toBe(200);
+    expect(await dashboard.json()).toMatchObject({
+      available:true,mock:true,partial:false,
+      metrics:{totalConversations:4,recordingsAvailable:3,recordingCoverage:75,averageDurationSeconds:((453+152+913+130)/4)},
+    });
+    const tooWide=await request(`/api/dashboard/summary?connectionId=mock&start=2026-10-01T00%3A00%3A00.000Z&end=2026-11-18T00%3A00%3A00.000Z`);
+    expect(tooWide.status).toBe(400);
+    const anonymous=await fetch(`${baseUrl}/api/dashboard/summary?connectionId=mock&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
+    expect(anonymous.status).toBe(401);
+  });
+
   it('filters and paginates audit events and persists the retention window', async () => {
     const defaultAudit = await request('/api/audit');
     expect(defaultAudit.status).toBe(200);

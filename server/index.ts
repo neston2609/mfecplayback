@@ -7,6 +7,9 @@ import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
+import { extractSingleAudioFromZip } from './zip-audio.js';
+import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from './transcription.js';
+import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from './wrapup.js';
 import { db, migrate } from './db/index.js';
 import { clearUserAppearance, getDefaultAppearance, getUserAppearance, parseAppearance, saveDefaultAppearance, saveUserAppearance } from './appearance.js';
 import { getRecordingMedia, isMessageRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from './recording-media.js';
@@ -360,7 +363,7 @@ app.post('/api/recordings/search', requireAuth, requireCsrf, rateLimit({windowMs
   } catch(error) { audit(req,'SEARCH','FAILED'); next(error); }
 });
 app.get('/api/recordings/conversations/:conversationId', requireAuth, async (req,res,next) => {
-  try { const conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.');if(String(req.query.connectionId||'')==='mock'&&process.env.MOCK_MODE==='true'){const mock=MOCK_CONVERSATIONS.find(item=>item.conversationId===conversationId);return mock?res.json(mock):res.status(404).json({error:'Conversation not found.'});}const connection = connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role); const client = new GenesysClient(connection); const conversation = await client.get(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`); audit(req,'DETAILS_VIEW','SUCCESS',connection.id,conversationId); res.json(redactSensitiveMetadata(conversation)); }
+  try { const conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.');if(String(req.query.connectionId||'')==='mock'&&process.env.MOCK_MODE==='true'){const mock=MOCK_CONVERSATIONS.find(item=>item.conversationId===conversationId);return mock?res.json({...mock,wrapUpNotes:collectAfterCallNotes(mock)}):res.status(404).json({error:'Conversation not found.'});}const connection = connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role); const client = new GenesysClient(connection); const conversation = await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`); const mapped=await mapWrapUpNames(client,conversation); audit(req,'DETAILS_VIEW','SUCCESS',connection.id,conversationId); res.json({...redactSensitiveMetadata(mapped),wrapUpNotes:collectAfterCallNotes(mapped)}); }
   catch(error) { next(error); }
 });
 app.get('/api/recordings/conversations/:conversationId/recordings', requireAuth, async (req,res,next) => {
@@ -371,6 +374,44 @@ app.get('/api/recordings/:recordingId/metadata', requireAuth, async (req,res,nex
   try { const cId=String(req.query.connectionId||''), conversationId=String(req.query.conversationId||''),recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.'); if(cId==='mock'&&process.env.MOCK_MODE==='true') { const r=(MOCK_RECORDINGS[conversationId] as any[]||[]).find(x=>x.id===recordingId); return r?res.json(safeRecording(r)):res.status(404).json({error:'Recording not found.'}); } const c=connectionById(cId,req.session.user!.id,req.session.user!.role); const item=await new GenesysClient(c).get<any>(recordingMediaRequestPath(conversationId,recordingId));if(!item)throw httpError(409,'Genesys did not return recording metadata.');audit(req,'RECORDING_METADATA_VIEW','SUCCESS',c.id,conversationId,recordingId); res.json(safeRecording(item)); }
   catch(error) { next(error); }
 });
+app.get('/api/recordings/conversations/:conversationId/transcription', requireAuth, requireRole('administrator','supervisor','quality_analyst'), async (req,res,next) => {
+  try {
+    const conversationId=String(req.params.conversationId||''),connectionId=String(req.query.connectionId||'');
+    if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.');
+    if(connectionId==='mock'&&process.env.MOCK_MODE==='true')throw httpError(501,'Synthetic Mock Mode does not include transcription data.');
+    const connection=connectionById(connectionId,req.session.user!.id,req.session.user!.role),client=new GenesysClient(connection);
+    const conversation=await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`);
+    const communicationIds=conversationCommunicationIds(conversation);
+    if(!communicationIds.length)throw httpError(404,'No voice communication was found for this conversation.');
+    const transcripts=await mapWithConcurrency(communicationIds,4,async communicationId=>{
+      try {
+        const value=await client.get<{url?:string}>(transcriptionRequestPath(conversationId,communicationId));
+        if(!value?.url)return undefined;
+        const transcriptUrl=validateTranscriptUrl(value.url);
+        let response:globalThis.Response;
+        try{response=await fetch(transcriptUrl,{signal:AbortSignal.timeout(20000),redirect:'manual'});}catch{throw httpError(502,'Genesys transcription could not be retrieved.');}
+        if(response.status>=300&&response.status<400){await response.body?.cancel().catch(()=>{});throw httpError(502,'Genesys transcript storage returned an unexpected redirect.');}
+        const body=await readBoundedBody(response,16*1024*1024);
+        const contentType=response.headers.get('content-type')||'';
+        let transcript:unknown;
+        try { transcript=JSON.parse(body.toString('utf8')); }
+        catch { if(/^text\/(?:plain|vtt)/i.test(contentType))transcript=body.toString('utf8');else throw httpError(502,'Genesys returned an invalid transcription document.'); }
+        return {communicationId,transcript:redactSensitiveMetadata(transcript)};
+      } catch(error) {
+        if(error instanceof GenesysError&&[404,409,410].includes(error.status))return undefined;
+        throw error;
+      }
+    });
+    const available=transcripts.filter((item):item is {communicationId:string;transcript:unknown}=>Boolean(item));
+    if(!available.length)throw httpError(404,'Genesys has no transcription available for this conversation. Check that transcription is enabled and the service account has Speech and Text Analytics permissions.');
+    audit(req,'TRANSCRIPTION_DOWNLOAD','SUCCESS',connection.id,conversationId);
+    res.setHeader('Content-Type','application/json; charset=utf-8');
+    res.setHeader('Content-Disposition',`attachment; filename="transcription-${conversationId.replace(/[^a-zA-Z0-9_-]/g,'_')}.json"`);
+    res.setHeader('Cache-Control','private, no-store, no-cache, must-revalidate');
+    res.setHeader('X-Content-Type-Options','nosniff');
+    res.json({conversationId,generatedAt:new Date().toISOString(),transcriptions:available});
+  } catch(error) { next(error); }
+});
 app.get('/api/recordings/:recordingId/stream', requireAuth, async (req,res,next) => {
   try {
     const cId=String(req.query.connectionId||''), conversationId=String(req.query.conversationId||'');
@@ -379,18 +420,93 @@ app.get('/api/recordings/:recordingId/stream', requireAuth, async (req,res,next)
     const c=connectionById(cId,req.session.user!.id,req.session.user!.role); const client=new GenesysClient(c);
     const recordingId=String(req.params.recordingId); const playable=await getRecordingMedia(client,conversationId,recordingId);
     if(!playable) throw httpError(409,'Genesys did not return a playable media URL after 8 attempts. The recording may still be processing, unavailable, or outside the service account’s recording access.');
-    if(isMessageRecording(playable.metadata)) throw httpError(409,'This is a Genesys message recording (not voice audio), so it cannot play in the audio player. Use Download to retrieve the message archive.');
     const uri=playable.mediaUri;
     const headers: Record<string,string>={}; if(req.headers.range) headers.Range=req.headers.range;
-    const media=await fetchTrustedMedia(uri,c,headers); await pipeMedia(req,res,media); audit(req,'PLAYBACK','SUCCESS',c.id,conversationId,recordingId);
+    let media=await fetchTrustedMedia(uri,c,headers);
+    if(isZipMediaContentType(media.headers.get('content-type'))){
+      await media.body?.cancel().catch(()=>{});
+      media=await fetchTrustedMedia(uri,c,{});
+      const zip=await readBoundedBody(media,128*1024*1024);
+      let playableAudio:{audio:Buffer;mimeType:string;filename:string};
+      try { playableAudio=extractSingleAudioFromZip(zip); }
+      catch(error) { throw httpError(409,error instanceof Error?error.message:'Genesys ZIP archive does not contain playable audio.'); }
+      serveAudioBuffer(req,res,playableAudio.audio,playableAudio.mimeType);
+    } else {
+      if(isMessageRecording(playable.metadata)){await media.body?.cancel().catch(()=>{});throw httpError(409,'This is a Genesys message recording (not voice audio), so it cannot play in the audio player. Use Download to retrieve the message archive.');}
+      await pipeMedia(req,res,media);
+    }
+    audit(req,'PLAYBACK','SUCCESS',c.id,conversationId,recordingId);
   } catch(error) { if(!res.headersSent){audit(req,'PLAYBACK','FAILED',undefined,String(req.query.conversationId||''),String(req.params.recordingId||''));next(error);} }
 });
 app.get('/api/recordings/:recordingId/download', requireAuth, requireRole('administrator','supervisor','quality_analyst'), async (req,res,next) => {
   let connection:Connection|undefined,conversationId='',recordingId='';
-  try { conversationId=String(req.query.conversationId||'');recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.');connection=connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role);const playable=await getRecordingMedia(new GenesysClient(connection),conversationId,recordingId);if(!playable)throw httpError(409,'Genesys did not return downloadable media after 8 attempts. The recording may still be processing or unavailable to the service account.');const response=await fetchTrustedMedia(playable.mediaUri,connection,{});const extension=isZipMediaContentType(response.headers.get('content-type'))?'.zip':'';res.setHeader('Content-Disposition',`attachment; filename="recording-${recordingId.replace(/[^a-zA-Z0-9_-]/g,'_')}${extension}"`);await pipeMedia(req,res,response,{allowZip:true});audit(req,'DOWNLOAD','SUCCESS',connection.id,conversationId,recordingId);}
+   try { conversationId=String(req.query.conversationId||'');recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.');connection=connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role);const playable=await getRecordingMedia(new GenesysClient(connection),conversationId,recordingId);if(!playable)throw httpError(409,'Genesys did not return downloadable media after 8 attempts. The recording may still be processing or unavailable to the service account.');const response=await fetchTrustedMedia(playable.mediaUri,connection,{});const extension=isZipMediaContentType(response.headers.get('content-type'))?'.zip':'';res.setHeader('Content-Disposition',`attachment; filename="recording-${recordingId.replace(/[^a-zA-Z0-9_-]/g,'_')}${extension}"`);await pipeMedia(req,res,response,{allowZip:true});audit(req,'DOWNLOAD','SUCCESS',connection.id,conversationId,recordingId);}
   catch(error) { audit(req,'DOWNLOAD','FAILED',connection?.id,conversationId||undefined,recordingId||undefined);next(error); }
 });
-app.get('/api/dashboard/summary', requireAuth, (_req,res) => res.json({ available:false, note:'Dashboard metrics are not calculated from a complete organization-wide query yet. Run a bounded search to review authorized results.', mock:process.env.MOCK_MODE==='true' }));
+app.get('/api/dashboard/summary', requireAuth, async (req,res,next) => {
+  try {
+    const connectionId=String(req.query.connectionId||''),startRaw=String(req.query.start||''),endRaw=String(req.query.end||'');
+    const from=Date.parse(startRaw),to=Date.parse(endRaw);
+    if(!connectionId||!Number.isFinite(from)||!Number.isFinite(to)||from>=to)throw httpError(400,'Choose an organization and a valid dashboard date range.');
+    if(to-from>30*86400000)throw httpError(400,'Dashboard date range cannot exceed 30 days.');
+    let conversations:any[]=[];
+    let partial=false;
+    let connection:Connection|undefined;
+    let client:GenesysClient|undefined;
+    if(connectionId==='mock'&&process.env.MOCK_MODE==='true'){
+      conversations=MOCK_CONVERSATIONS.filter(item=>{const time=Date.parse(item.conversationStart);return time>=from&&time<to;});
+    }else{
+      connection=connectionById(connectionId,req.session.user!.id,req.session.user!.role);
+      client=new GenesysClient(connection);
+      const unique=new Map<string,any>();
+      for(let chunkStart=from;chunkStart<to;){
+        const chunkEnd=Math.min(to,chunkStart+7*86400000);
+        let pageNumber=1,totalHits:number|undefined;
+        let chunkHits=0;
+        while(pageNumber<=10&&unique.size<1000){
+          const response=await client.post<{conversations?:any[];totalHits?:number;totalCount?:number}>('/api/v2/analytics/conversations/details/query',{
+            interval:`${new Date(chunkStart).toISOString()}/${new Date(chunkEnd).toISOString()}`,
+            paging:{pageSize:100,pageNumber},order:'desc',orderBy:'conversationStart',
+          });
+          const page=response.conversations||[];
+          for(const conversation of page)if(conversation?.conversationId&&!unique.has(conversation.conversationId)){unique.set(conversation.conversationId,conversation);chunkHits++;}
+          totalHits=response.totalHits??response.totalCount??totalHits;
+          if(page.length<100||(totalHits!==undefined&&chunkHits>=totalHits))break;
+          pageNumber++;
+        }
+        if(pageNumber>10||unique.size>=1000)partial=true;
+        if(unique.size>=1000)break;
+        chunkStart=chunkEnd;
+      }
+      conversations=[...unique.values()].filter(item=>{const time=Date.parse(item.conversationStart);return time>=from&&time<to;});
+    }
+    let recordingsKnown=true;
+    const enriched=await mapWithConcurrency(conversations,5,async conversation=>{
+      let recordingCount=(MOCK_RECORDINGS[conversation.conversationId] as any[]||[]).length;
+      if(client){
+        try{const recordings=await client.get<unknown>(`/api/v2/conversations/${encodeURIComponent(conversation.conversationId)}/recordings`);recordingCount=Array.isArray(recordings)?recordings.length:0;}
+        catch(error){if(error instanceof GenesysError&&error.status===404)recordingCount=0;else if(error instanceof GenesysError&&error.status===403){recordingsKnown=false;partial=true;recordingCount=0;}else throw error;}
+      }
+      return {conversation,recordingCount};
+    });
+    const counts=new Map<string,number>();
+    let recordingsAvailable=0,recordedConversations=0,durationTotal=0,durationCount=0;
+    for(const {conversation,recordingCount} of enriched){
+      const day=String(conversation.conversationStart||'').slice(0,10);
+      if(day)counts.set(day,(counts.get(day)||0)+1);
+      recordingsAvailable+=recordingCount;
+      if(recordingCount>0)recordedConversations++;
+      const start=Date.parse(conversation.conversationStart),end=Date.parse(conversation.conversationEnd);
+      if(Number.isFinite(start)&&Number.isFinite(end)&&end>=start){durationTotal+=(end-start)/1000;durationCount++;}
+    }
+    const days=Array.from({length:Math.ceil((to-from)/86400000)},(_,index)=>{
+      const date=new Date(from+index*86400000).toISOString().slice(0,10);
+      return {date,count:counts.get(date)||0};
+    });
+    audit(req,'DASHBOARD_VIEW','SUCCESS',connection?.id||'mock',undefined,undefined,{start:new Date(from).toISOString(),end:new Date(to).toISOString(),conversations:conversations.length,partial});
+    res.json({available:true,partial,mock:!client,connectionId,start:new Date(from).toISOString(),end:new Date(to).toISOString(),metrics:{totalConversations:conversations.length,recordingsAvailable,recordingCoverage:recordingsKnown?(conversations.length?recordedConversations/conversations.length*100:0):null,averageDurationSeconds:durationCount?durationTotal/durationCount:null},interactionsByDay:days});
+  }catch(error){next(error);}
+});
  app.get('/api/audit', requireAuth, requireRole('administrator'), (req,res,next) => { try {const pageSizeRaw=Number(req.query.pageSize)||25;const pageSize=[25,50,100,200].includes(pageSizeRaw)?pageSizeRaw:25;const filters={username:String(req.query.username||'').trim().slice(0,128),action:String(req.query.action||'').trim().slice(0,80),result:String(req.query.result||'').trim().slice(0,16),from:String(req.query.from||'').trim(),to:String(req.query.to||'').trim(),query:String(req.query.query||'').trim().slice(0,128)};if(filters.result&&!['SUCCESS','FAILED','DENIED'].includes(filters.result))throw httpError(400,'Audit result filter is invalid.');const conditions:string[]=[],values:unknown[]=[];if(filters.username){conditions.push('username LIKE ?');values.push(`%${escapeLike(filters.username)}%`);}if(filters.action){conditions.push('action=?');values.push(filters.action);}if(filters.result){conditions.push('result=?');values.push(filters.result);}if(filters.from){const from=Date.parse(filters.from);if(!Number.isFinite(from))throw httpError(400,'Start date filter is invalid.');conditions.push('created_at>=?');values.push(new Date(from).toISOString());}if(filters.to){const to=Date.parse(filters.to);if(!Number.isFinite(to))throw httpError(400,'End date filter is invalid.');conditions.push('created_at<?');values.push(new Date(to+86400000).toISOString());}if(filters.query){const pattern=`%${escapeLike(filters.query)}%`;conditions.push('(username LIKE ? ESCAPE \'\\\' OR action LIKE ? ESCAPE \'\\\' OR connection_id LIKE ? ESCAPE \'\\\' OR conversation_id LIKE ? ESCAPE \'\\\' OR recording_id LIKE ? ESCAPE \'\\\' OR source_ip LIKE ? ESCAPE \'\\\')');values.push(pattern,pattern,pattern,pattern,pattern,pattern);}const where=conditions.length?`WHERE ${conditions.join(' AND ')}`:'';const total=Number((db.prepare(`SELECT COUNT(*) AS n FROM audit_logs ${where}`).get(...values) as {n:number}).n);const pages=Math.max(1,Math.ceil(total/pageSize));const page=Math.min(pages,Math.max(1,Number(req.query.page)||1));const logs=db.prepare(`SELECT id,username,action,result,connection_id AS connectionId,conversation_id AS conversationId,recording_id AS recordingId,source_ip AS sourceIp,created_at AS createdAt FROM audit_logs ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...values,pageSize,(page-1)*pageSize);res.json({logs,page,pageSize,total,totalPages:pages,filters});}catch(error){next(error);} });
 app.get('/api/admin/audit-retention',requireAuth,requireRole('administrator'),(_req,res)=>res.json({days:getAuditRetentionDays(),defaultDays:35}));
 app.put('/api/admin/audit-retention',requireAuth,requireRole('administrator'),requireCsrf,(req,res,next)=>{try{const {days}=z.object({days:z.number().int().min(1).max(3650)}).parse(req.body);db.prepare(`INSERT INTO application_settings(key,value_json) VALUES('audit_retention_days',?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json`).run(JSON.stringify(days));const deleted=purgeExpiredAuditLogs();audit(req,'AUDIT_RETENTION_UPDATE','SUCCESS',undefined,undefined,undefined,{days,deleted});res.json({days,deleted});}catch(error){next(error);}});
@@ -421,6 +537,7 @@ function getAuditRetentionDays(){const row=db.prepare("SELECT value_json FROM ap
 function purgeExpiredAuditLogs(){const cutoff=new Date(Date.now()-getAuditRetentionDays()*86400000).toISOString();return Number(db.prepare('DELETE FROM audit_logs WHERE created_at<?').run(cutoff).changes);}
 function escapeLike(value:string){return value.replace(/[\\%_]/g,'\\$&');}
 function redactSensitiveMetadata(value:any):any{if(Array.isArray(value))return value.map(redactSensitiveMetadata);if(value&&typeof value==='object'){const safe:Record<string,unknown>={};for(const [key,item] of Object.entries(value)){if(/token|secret|authorization|mediaUri|signed|url/i.test(key))safe[key]='[REDACTED]';else safe[key]=redactSensitiveMetadata(item);}return safe;}return value;}
+async function mapWrapUpNames(client:GenesysClient,conversation:any){const ids=collectWrapUpCodeIds(conversation);if(!ids.length)return conversation;const entries=await mapWithConcurrency(ids,4,async id=>{try{const code=await client.get<{id?:string;name?:string}>(`/api/v2/routing/wrapupcodes/${encodeURIComponent(id)}`);return [id,typeof code?.name==='string'&&code.name.trim()?code.name:undefined] as const;}catch(error){if(error instanceof GenesysError&&[403,404].includes(error.status))return [id,undefined] as const;throw error;}});return withWrapUpCodeNames(conversation,Object.fromEntries(entries.filter((entry):entry is readonly [string,string]=>Boolean(entry[1]))));}
 function publicError(error:unknown){if(error instanceof Error)return error.message.slice(0,200);return 'Connection test failed.';}
 function httpError(status:number,message:string){return Object.assign(new Error(message),{status});}
 function errorHandler(error:unknown,_req:Request,res:ExpressResponse,_next:NextFunction){const status=Number((error as any)?.status)|| (error instanceof z.ZodError?400:500);if(status===500)console.error('Request failed:',error);res.status(status).json({error:status===500?'Request failed. Check server logs using the correlation time.':publicError(error),...(error instanceof z.ZodError?{issues:error.issues.map(i=>({path:i.path,message:i.message}))}:{})});}
@@ -430,7 +547,9 @@ function matchesPhone(c:any,input:z.infer<typeof searchSchema>){return (!input.p
 function summarize(c:any){const participants=c.participants||[],agents=new Set<string>(),flows=new Set<string>(),queues=new Set<string>();let phone='',dnis='',wrapUp='';for(const p of participants){if(p.purpose==='agent')agents.add(p.participantName||p.userId||'Agent');if(p.purpose==='ivr'||p.purpose==='flow')flows.add(p.sessions?.[0]?.flowName||p.participantName||'IVR flow');for(const s of p.sessions||[]){phone ||= s.ani||'';dnis ||= s.dnis||'';if(s.queueName)queues.add(s.queueName);for(const seg of s.segments||[])if(seg.wrapUpCode)wrapUp=seg.wrapUpCode;}}const hasBot=flows.size>0;return {conversationId:c.conversationId,conversationStart:c.conversationStart,conversationEnd:c.conversationEnd,direction:c.originatingDirection||'unknown',ani:phone,dnis,agents:[...agents],flows:[...flows],queues:[...queues],wrapUp,durationSeconds:c.conversationStart&&c.conversationEnd?Math.round((Date.parse(c.conversationEnd)-Date.parse(c.conversationStart))/1000):null,interactionType:agents.size&&hasBot?'Bot to Agent':agents.size>1?'Multi-Agent':agents.size?'Human Agent':hasBot?'Bot Only':'Unknown'};}
 function validateMediaUrl(value:string,connection:Connection){try{return validateRecordingMediaUrl(value,connection);}catch(error){throw httpError(502,error instanceof Error?error.message:'Genesys returned an invalid recording media URL.');}}
 async function pipeMedia(_req:Request,res:ExpressResponse,response:globalThis.Response,options:{allowZip?:boolean}={}){if(!response.ok&&response.status!==206){throw httpError(response.status===403?410:502,response.status===403?'Recording media URL has expired. Retry playback to obtain a fresh URL.':'Recording media could not be retrieved.');}const type=response.headers.get('content-type')||'';if(isZipMediaContentType(type)&&!options.allowZip){await response.body?.cancel().catch(()=>{});throw httpError(409,'Genesys returned a ZIP message recording archive, not playable audio. This recording cannot play in the audio player; use Download to retrieve the archive.');}if(!/^audio\//i.test(type)&&!/^video\/webm/i.test(type)&&!/^application\/octet-stream/i.test(type)&&!(options.allowZip&&isZipMediaContentType(type)))throw httpError(502,'Genesys returned an unsupported media content type.');res.status(response.status);res.setHeader('Content-Type',type);res.setHeader('Cache-Control','private, no-store, no-cache, must-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Accept-Ranges',response.headers.get('accept-ranges')||'bytes');const length=response.headers.get('content-length'),range=response.headers.get('content-range');if(length)res.setHeader('Content-Length',length);if(range)res.setHeader('Content-Range',range);if(!response.body)throw httpError(502,'Recording media response was empty.');const stream=Readable.fromWeb(response.body as import('node:stream/web').ReadableStream);const onClose=()=>{if(!res.writableEnded)stream.destroy(new Error('Downstream playback client disconnected.'));};res.once('close',onClose);try{await new Promise<void>((resolve,reject)=>{stream.once('error',reject);res.once('error',reject);res.once('finish',resolve);stream.pipe(res);});}finally{res.off('close',onClose);}}
-function safeRecording(r:any){const mediaUris=r.mediaUris,hasMedia=Boolean((Array.isArray(mediaUris)&&mediaUris.some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||(mediaUris&&typeof mediaUris==='object'&&!Array.isArray(mediaUris)&&Object.values(mediaUris).some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||typeof r.mediaUri==='string'&&r.mediaUri);return {id:r.id||r.recordingId,startTime:r.startTime||r.recordingStartTime,endTime:r.endTime||r.recordingEndTime,status:r.status||r.recordingState||'UNKNOWN',media:r.media,mediaType:r.mediaType,durationMs:r.durationMs,hasMedia};}
+async function readBoundedBody(response:globalThis.Response,limit:number):Promise<Buffer>{if(!response.ok){await response.body?.cancel().catch(()=>{});throw httpError(response.status===403?410:502,'Recording media could not be retrieved.');}const declared=Number(response.headers.get('content-length')||0);if(declared>limit){await response.body?.cancel().catch(()=>{});throw httpError(413,'Recording ZIP archive exceeds the safe playback size limit.');}if(!response.body)throw httpError(502,'Recording media response was empty.');const reader=response.body.getReader(),chunks:Buffer[]=[];let total=0;try{while(true){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>limit){await reader.cancel();throw httpError(413,'Recording ZIP archive exceeds the safe playback size limit.');}chunks.push(Buffer.from(value));}}finally{reader.releaseLock();}return Buffer.concat(chunks,total);}
+function serveAudioBuffer(req:Request,res:ExpressResponse,audio:Buffer,mimeType:string){const match=/^bytes=(\d*)-(\d*)$/.exec(req.headers.range||'');let start=0,end=audio.length-1;if(match){if(!match[1]&&!match[2])throw httpError(416,'Requested audio range is invalid.');if(!match[1]){const suffix=Number(match[2]);if(!Number.isSafeInteger(suffix)||suffix<=0)throw httpError(416,'Requested audio range is invalid.');start=Math.max(0,audio.length-suffix);}else{start=Number(match[1]);if(match[2])end=Number(match[2]);}if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||start>=audio.length||end<start){res.status(416).setHeader('Content-Range',`bytes */${audio.length}`).end();return;}end=Math.min(end,audio.length-1);}res.status(match?206:200);res.setHeader('Content-Type',mimeType);res.setHeader('Content-Length',String(end-start+1));res.setHeader('Accept-Ranges','bytes');if(match)res.setHeader('Content-Range',`bytes ${start}-${end}/${audio.length}`);res.setHeader('Cache-Control','private, no-store, no-cache, must-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('X-Content-Type-Options','nosniff');res.end(audio.subarray(start,end+1));}
+function safeRecording(r:any){const mediaUris=r.mediaUris,mediaUriAvailable=(Array.isArray(mediaUris)&&mediaUris.some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||(mediaUris&&typeof mediaUris==='object'&&!Array.isArray(mediaUris)&&Object.values(mediaUris).some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||typeof r.mediaUri==='string'&&r.mediaUri,hasMedia=Boolean(mediaUriAvailable||(process.env.MOCK_MODE!=='true'&&(r.id||r.recordingId)));return {id:r.id||r.recordingId,startTime:r.startTime||r.recordingStartTime,endTime:r.endTime||r.recordingEndTime,status:r.status||r.recordingState||'UNKNOWN',media:r.media,mediaType:r.mediaType,durationMs:r.durationMs,hasMedia};}
 async function fetchTrustedMedia(value:string,connection:Connection,headers:Record<string,string>){let url=validateMediaUrl(value,connection);for(let redirects=0;redirects<=2;redirects++){let response:globalThis.Response;try{response=await fetch(url,{headers,signal:AbortSignal.timeout(30000),redirect:'manual'});}catch{throw httpError(502,'Recording media could not be reached. Retry playback.');}if(response.status<300||response.status>=400)return response;const location=response.headers.get('location');if(!location)throw httpError(502,'Recording media redirect was invalid.');if(redirects===2)throw httpError(502,'Recording media returned too many redirects.');let next:URL;try{next=new URL(location,url);}catch{throw httpError(502,'Recording media redirect was invalid.');}url=validateMediaUrl(next.toString(),connection);}throw httpError(502,'Recording media redirect was invalid.');}
 async function mapWithConcurrency<T,R>(items:T[],limit:number,work:(item:T)=>Promise<R>):Promise<R[]>{const output=new Array<R>(items.length);let cursor=0;async function worker(){while(true){const index=cursor++;if(index>=items.length)return;output[index]=await work(items[index]);}}await Promise.all(Array.from({length:Math.min(limit,items.length)},worker));return output;}
 function rejectCrossOrigin(req:Request,res:ExpressResponse,next:NextFunction){const origin=req.get('origin'),fetchSite=req.get('sec-fetch-site');if(fetchSite==='cross-site')return res.status(403).json({error:'Cross-site API requests are not allowed.'});if(origin){try{const expected=new URL(process.env.APP_ORIGIN||'http://localhost:5173').origin;if(new URL(origin).origin!==expected)return res.status(403).json({error:'Request origin is not allowed.'});}catch{return res.status(403).json({error:'Request origin is not allowed.'});}}next();}

@@ -1,9 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { deflateRawSync } from 'node:zlib';
 import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../regions.js';
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
 import { getRecordingMedia, isMessageRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
+import { extractSingleAudioFromZip } from '../zip-audio.js';
+import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
+import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from '../wrapup.js';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
@@ -140,4 +144,102 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(isMessageRecording({ media: 'voice' })).toBe(false);
   });
 
+  it('extracts one supported and verified audio file from ZIP without writing archive paths', () => {
+    const mp3 = Buffer.from('ID3synthetic-test-audio');
+    const extracted = extractSingleAudioFromZip(makeZip([{ name: 'folder/recording.mp3', data: mp3 }]));
+    expect(extracted.audio).toEqual(mp3);
+    expect(extracted.mimeType).toBe('audio/mpeg');
+    expect(extracted.filename).toBe('recording.mp3');
+  });
+
+  it('rejects malformed, non-audio, and ambiguous ZIP recording archives', () => {
+    expect(() => extractSingleAudioFromZip(Buffer.from('not a zip'))).toThrow(/zip/i);
+    expect(() => extractSingleAudioFromZip(makeZip([{ name: 'message.json', data: Buffer.from('{"message":"hello"}') }]))).toThrow(/supported audio/i);
+    expect(() => extractSingleAudioFromZip(makeZip([
+      { name: 'first.mp3', data: Buffer.from('ID3first') },
+      { name: 'second.mp3', data: Buffer.from('ID3second') },
+    ]))).toThrow(/exactly one audio/i);
+    expect(() => extractSingleAudioFromZip(makeZip([{ name: 'recording.mp3', data: Buffer.from('<html>not audio</html>') }]))).toThrow(/format or integrity/i);
+    expect(() => extractSingleAudioFromZip(makeZip([{ name: '../recording.mp3', data: Buffer.from('ID3test') }]))).toThrow(/unsafe file name/i);
+  });
+
+  it('builds a safe transcript endpoint path and selects only voice communication IDs', () => {
+    expect(transcriptionRequestPath('conversation/id', 'communication id')).toBe('/api/v2/speechandtextanalytics/conversations/conversation%2Fid/communications/communication%20id/transcripturl');
+    expect(conversationCommunicationIds({participants:[
+      {sessions:[{mediaType:'voice',sessionId:'voice-1'},{mediaType:'voice',communicationId:'voice-2'}]},
+      {sessions:[{mediaType:'chat',communicationId:'chat-1'},{communicationId:'voice-1'}]},
+      {sessions:[{mediaType:'voice',communicationId:'x'.repeat(129)}]},
+    ]})).toEqual(['voice-1','voice-2']);
+  });
+
+  it('validates signed Genesys transcript URLs before fetching them server-side', () => {
+    const good='https://genesys-transcripts.s3.amazonaws.com/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600';
+    expect(validateTranscriptUrl(good).hostname).toBe('genesys-transcripts.s3.amazonaws.com');
+    expect(()=>validateTranscriptUrl('https://attacker.example/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600')).toThrow(/untrusted/i);
+    expect(()=>validateTranscriptUrl('http://genesys-transcripts.s3.amazonaws.com/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600')).toThrow(/untrusted/i);
+  });
+
+  it('extracts the true after-call summary note and maps wrap-up UUIDs to names', () => {
+    const id='2816e6e2-0c0b-4a90-a147-61e20f80435d';
+    const conversation={participants:[{participantName:'Agent A',sessions:[{segments:[{wrapUpCode:id,wrapUpNote:'Customer confirmed resolution.'}]}]}]};
+    expect(collectWrapUpCodeIds(conversation)).toEqual([id]);
+    expect(collectAfterCallNotes(conversation)).toEqual([{agent:'Agent A',note:'Customer confirmed resolution.'}]);
+    const mapped=withWrapUpCodeNames(conversation,{[id]:'Issue Resolved'});
+    expect(mapped.participants[0].sessions[0].segments[0]).toMatchObject({wrapUpCodeName:'Issue Resolved',wrapUpNote:'Customer confirmed resolution.'});
+    expect(collectAfterCallNotes({participants:[{sessions:[{segments:[{wrapUpCodeNote:'not the agent note'}]}]}]})).toEqual([]);
+  });
+
 });
+
+function makeZip(files: { name: string; data: Buffer }[]): Buffer {
+  const local: Buffer[] = [];
+  const central: Buffer[] = [];
+  let localOffset = 0;
+  for (const file of files) {
+    const name = Buffer.from(file.name, 'utf8');
+    const compressed = deflateRawSync(file.data);
+    const checksum = testCrc32(file.data);
+    const header = Buffer.alloc(30);
+    header.writeUInt32LE(0x04034b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(0x800, 6);
+    header.writeUInt16LE(8, 8);
+    header.writeUInt32LE(checksum, 14);
+    header.writeUInt32LE(compressed.length, 18);
+    header.writeUInt32LE(file.data.length, 22);
+    header.writeUInt16LE(name.length, 26);
+    local.push(header, name, compressed);
+
+    const directory = Buffer.alloc(46);
+    directory.writeUInt32LE(0x02014b50, 0);
+    directory.writeUInt16LE(0x0314, 4);
+    directory.writeUInt16LE(20, 6);
+    directory.writeUInt16LE(0x800, 8);
+    directory.writeUInt16LE(8, 10);
+    directory.writeUInt32LE(checksum, 16);
+    directory.writeUInt32LE(compressed.length, 20);
+    directory.writeUInt32LE(file.data.length, 24);
+    directory.writeUInt16LE(name.length, 28);
+    directory.writeUInt32LE(0x81a40000, 38);
+    directory.writeUInt32LE(localOffset, 42);
+    central.push(directory, name);
+    localOffset += header.length + name.length + compressed.length;
+  }
+  const centralBytes = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralBytes.length, 12);
+  end.writeUInt32LE(localOffset, 16);
+  return Buffer.concat([...local, centralBytes, end]);
+}
+
+function testCrc32(data: Buffer): number {
+  let value = 0xffffffff;
+  for (const byte of data) {
+    value ^= byte;
+    for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  }
+  return (value ^ 0xffffffff) >>> 0;
+}
