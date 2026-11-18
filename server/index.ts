@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { db, migrate } from './db/index.js';
 import { BetterSqliteSessionStore } from './session-store.js';
 import { encrypt, safeEqual } from './security.js';
-import { REGIONS, trustedBaseUrl } from './regions.js';
+import { getRegions, saveRegions, trustedBaseUrl, validateRegionEndpoints, type GenesysRegion } from './regions.js';
 import { connectionById, type Connection } from './genesys.js';
 import { GenesysClient, GenesysError, verifyGenesysApiAccess } from './genesys-client.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from './mock.js';
@@ -94,14 +94,57 @@ app.post('/api/auth/password', requireAuth, requireCsrf, async (req, res, next) 
   } catch (error) { next(error); }
 });
 
-app.get('/api/genesys/regions', requireAuth, (_req, res) => res.json({ regions: REGIONS }));
+app.get('/api/genesys/regions', requireAuth, (_req, res) => res.json({ regions: getRegions() }));
+app.put('/api/genesys/regions', requireAuth, requireAdmin, requireCsrf, (req, res, next) => {
+  try {
+    const regions = z.array(z.object({
+      id: z.string().trim().min(2).max(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+      name: z.string().trim().min(2).max(120),
+      api: z.string().url().max(256),
+      oauth: z.string().url().max(256),
+    })).max(100).parse(req.body.regions) as GenesysRegion[];
+    const ids = new Set<string>();
+    const endpoints = new Set<string>();
+    const oldRegions = getRegions();
+    for (const region of regions) {
+      if (ids.has(region.id)) throw httpError(400, `Duplicate region ID: ${region.id}.`);
+      ids.add(region.id);
+      let validated: { api: string; oauth: string };
+      try { validated = validateRegionEndpoints(region.api, region.oauth); }
+      catch { throw httpError(400, `Region "${region.name}" must use matching trusted Genesys Cloud API and OAuth URLs.`); }
+      if (endpoints.has(validated.api) || endpoints.has(validated.oauth)) throw httpError(400, 'Each region must use unique API and OAuth URLs.');
+      endpoints.add(validated.api);
+      endpoints.add(validated.oauth);
+      region.api = validated.api;
+      region.oauth = validated.oauth;
+    }
+    const transaction = db.transaction(() => {
+      const nextRegions = new Map(regions.map(region => [region.id, region]));
+      const updateConnection = db.prepare('UPDATE connections SET api_base_url=?,oauth_base_url=?,last_success_at=NULL,last_error=NULL,updated_at=? WHERE id=?');
+      for (const connection of db.prepare('SELECT id,region_id,api_base_url,oauth_base_url FROM connections').all() as { id: string; region_id: string; api_base_url: string; oauth_base_url: string }[]) {
+        const previous = oldRegions.find(region => region.id === connection.region_id);
+        const replacement = nextRegions.get(connection.region_id);
+        if (!replacement) {
+          throw httpError(409, `Region ${connection.region_id} is still used by a saved connection. Update its endpoints or remove that connection before deleting the region.`);
+        }
+        if(!previous)throw httpError(409, `Saved connection ${connection.id} references an unknown region. Reassign it before updating region configuration.`);
+        const endpointsChanged=connection.api_base_url!==replacement.api||connection.oauth_base_url!==replacement.oauth;
+        if(endpointsChanged)updateConnection.run(replacement.api, replacement.oauth, new Date().toISOString(), connection.id);
+      }
+      saveRegions(regions);
+    });
+    transaction();
+    audit(req, 'GENESYS_REGIONS_UPDATE', 'SUCCESS', undefined, undefined, undefined, { regionCount: regions.length });
+    res.json({ regions: getRegions() });
+  } catch (error) { next(error); }
+});
 app.get('/api/genesys/connections', requireAuth, (req, res) => {
   const rows = req.session.user!.role === 'administrator'
     ? (process.env.MOCK_MODE === 'true' ? [] : db.prepare("SELECT id,name,organization_label,region_id,api_base_url,oauth_base_url,enabled,is_default,last_success_at,CASE WHEN last_error IS NULL THEN NULL ELSE 'Connection check failed. Review administrator logs.' END AS last_error,client_id,CASE WHEN client_secret_enc='' THEN 0 ELSE 1 END AS secret_configured FROM connections ORDER BY name").all())
     : (process.env.MOCK_MODE === 'true' ? [] : db.prepare('SELECT c.id,c.name,c.organization_label,c.region_id,c.api_base_url,c.oauth_base_url,c.enabled,c.is_default,c.last_success_at,c.last_error,c.client_id,1 AS secret_configured FROM connections c JOIN user_connection_access a ON a.connection_id=c.id WHERE a.user_id=? AND c.enabled=1 ORDER BY c.name').all(req.session.user!.id));
   const values = process.env.MOCK_MODE === 'true' ? [{ id: 'mock', name: 'Synthetic Demo Organization', organization_label: 'Mock Mode · Synthetic data', region_id: 'ap-southeast-1', enabled: 1, is_default: 1, last_success_at: null, last_error: null, client_id: '', secret_configured: 0, mock: true }] : [];
   const validRows=(rows as any[])
-    .filter(connection=>REGIONS.some(region=>region.id===connection.region_id&&region.api===connection.api_base_url&&region.oauth===connection.oauth_base_url))
+    .filter(connection=>getRegions().some(region=>region.id===connection.region_id&&region.api===connection.api_base_url&&region.oauth===connection.oauth_base_url))
     .map(({api_base_url,oauth_base_url,...connection})=>connection);
   res.json({ connections: [...values, ...validRows] });
 });
@@ -109,8 +152,8 @@ app.post('/api/genesys/connections', requireAuth, requireAdmin, requireCsrf, (re
   try {
     const input = connectionSchema.parse(req.body);
     if(process.env.MOCK_MODE==='true')throw httpError(409,'Disable Mock Mode and restart the application before saving live Genesys credentials.');
-    const region = REGIONS.find(r => r.id === input.regionId); if (!region) throw httpError(400, 'Unknown Genesys region.');
-    let apiUrl:string,oauthUrl:string;try{apiUrl=trustedBaseUrl(input.apiBaseUrl || region.api, 'api');oauthUrl=trustedBaseUrl(input.oauthBaseUrl || region.oauth, 'oauth');}catch{throw httpError(400,'The endpoint must exactly match an official Genesys Cloud region URL.');}
+    const region = getRegions().find(r => r.id === input.regionId); if (!region) throw httpError(400, 'Unknown Genesys region.');
+    let apiUrl:string,oauthUrl:string;try{apiUrl=trustedBaseUrl(input.apiBaseUrl || region.api, 'api',getRegions());oauthUrl=trustedBaseUrl(input.oauthBaseUrl || region.oauth, 'oauth',getRegions());}catch{throw httpError(400,'The endpoint must exactly match a configured Genesys Cloud region URL.');}
     if(apiUrl!==region.api||oauthUrl!==region.oauth)throw httpError(400,'API and OAuth base URLs must match the selected official region.');
     const id = crypto.randomUUID(), now = new Date().toISOString();
     const transaction = db.transaction(() => {
@@ -127,11 +170,11 @@ app.put('/api/genesys/connections/:id', requireAuth, requireAdmin, requireCsrf, 
   try {
     const existing = db.prepare('SELECT * FROM connections WHERE id=?').get(req.params.id) as Connection | undefined;
     if (!existing) throw httpError(404,'Connection not found.');
-    if(!REGIONS.some(value=>value.id===existing.region_id&&value.api===existing.api_base_url&&value.oauth===existing.oauth_base_url))throw httpError(409,'The stored connection endpoints are not trusted. Remove and recreate this connection with an official region.');
+    if(!getRegions().some(value=>value.id===existing.region_id&&value.api===existing.api_base_url&&value.oauth===existing.oauth_base_url))throw httpError(409,'The stored connection endpoints are not trusted. Reconfigure this connection to a configured region.');
     const input = connectionSchema.partial({ clientSecret: true }).parse(req.body);
     if(process.env.MOCK_MODE==='true')throw httpError(409,'Disable Mock Mode and restart the application before updating live Genesys credentials.');
-    const region = REGIONS.find(r => r.id === (input.regionId || existing.region_id)); if (!region) throw httpError(400,'Unknown Genesys region.');
-    let apiUrl:string,oauthUrl:string;try{apiUrl=trustedBaseUrl(input.apiBaseUrl || region.api,'api');oauthUrl=trustedBaseUrl(input.oauthBaseUrl || region.oauth,'oauth');}catch{throw httpError(400,'The endpoint must exactly match an official Genesys Cloud region URL.');}
+    const region = getRegions().find(r => r.id === (input.regionId || existing.region_id)); if (!region) throw httpError(400,'Unknown Genesys region.');
+    let apiUrl:string,oauthUrl:string;try{apiUrl=trustedBaseUrl(input.apiBaseUrl || region.api,'api',getRegions());oauthUrl=trustedBaseUrl(input.oauthBaseUrl || region.oauth,'oauth',getRegions());}catch{throw httpError(400,'The endpoint must exactly match a configured Genesys Cloud region URL.');}
     if(apiUrl!==region.api||oauthUrl!==region.oauth)throw httpError(400,'API and OAuth base URLs must match the selected official region.');
     const nextEnabled=Boolean(input.enabled ?? Boolean(existing.enabled));
     const nextClientId=input.clientId ?? existing.client_id;
@@ -152,10 +195,10 @@ app.post('/api/genesys/connections/test', requireAuth, requireAdmin, requireCsrf
   try {
     if(process.env.MOCK_MODE==='true')throw httpError(409,'Mock Mode is active. Live Genesys connectivity tests are disabled.');
     const input=connectionTestSchema.parse(req.body);
-    const region=REGIONS.find(value=>value.id===input.regionId);
+    const region=getRegions().find(value=>value.id===input.regionId);
     if(!region)throw httpError(400,'Unknown Genesys region.');
     let apiUrl:string,oauthUrl:string;
-    try{apiUrl=trustedBaseUrl(input.apiBaseUrl||region.api,'api');oauthUrl=trustedBaseUrl(input.oauthBaseUrl||region.oauth,'oauth');}
+    try{apiUrl=trustedBaseUrl(input.apiBaseUrl||region.api,'api',getRegions());oauthUrl=trustedBaseUrl(input.oauthBaseUrl||region.oauth,'oauth',getRegions());}
     catch{throw httpError(400,'The endpoint must exactly match an official Genesys Cloud region URL.');}
     if(apiUrl!==region.api||oauthUrl!==region.oauth)throw httpError(400,'API and OAuth base URLs must match the selected official region.');
     let secretEnc:string;
@@ -182,7 +225,7 @@ app.post('/api/genesys/connections/:id/test', requireAuth, requireAdmin, require
     const id=String(req.params.id); const connection = db.prepare('SELECT * FROM connections WHERE id=?').get(id) as Connection | undefined;
     if (!connection) throw httpError(404,'Connection not found.');
     if(!connection.enabled)throw httpError(409,'Enable the connection before testing it.');
-    if(!REGIONS.some(value=>value.id===connection.region_id&&value.api===connection.api_base_url&&value.oauth===connection.oauth_base_url))throw httpError(409,'The connection endpoints are not trusted.');
+    if(!getRegions().some(value=>value.id===connection.region_id&&value.api===connection.api_base_url&&value.oauth===connection.oauth_base_url))throw httpError(409,'The connection endpoints are not trusted.');
     const client = new GenesysClient(connection); client.clearCachedToken();
     let organization:{id?:string;name?:string};
     try { await client.accessToken(); organization=await verifyGenesysApiAccess(client); }

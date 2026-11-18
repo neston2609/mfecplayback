@@ -177,6 +177,13 @@ describe('HTTP API security and Mock Mode flows', () => {
       expect(body.connections[0]).not.toHaveProperty('oauth_base_url');
       expect(body.connections[0]).not.toHaveProperty('client_secret_enc');
       expect(JSON.stringify(body)).not.toContain('integration-secret-that-must-not-leak');
+
+      const deleteUsedRegion = await fetch(`${liveUrl}/api/genesys/regions`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json', cookie: liveCookie, 'x-csrf-token': liveCsrf, Origin: 'http://localhost:5173' },
+        body: JSON.stringify({ regions: [] }),
+      });
+      expect(deleteUsedRegion.status).toBe(409);
     } finally {
       if (liveChild && liveChild.exitCode === null) {
         await fetch(`${liveUrl}/__test/shutdown`, { method: 'POST' }).catch(() => undefined);
@@ -185,6 +192,36 @@ describe('HTTP API security and Mock Mode flows', () => {
       await fs.rm(liveDirectory, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it('lets administrators manage trusted regions and refuses to delete one used by a saved connection', async () => {
+    const original = await request('/api/genesys/regions');
+    expect(original.status).toBe(200);
+    const originalRegions = (await original.json() as { regions: { id: string; name: string; api: string; oauth: string }[] }).regions;
+    const add = await request('/api/genesys/regions', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ regions: [...originalRegions, { id: 'ca-central-1', name: 'Canada Central', api: 'https://api.cac1.pure.cloud', oauth: 'https://login.cac1.pure.cloud' }] }),
+    }, true);
+    expect(add.status).toBe(200);
+    expect((await add.json() as { regions: { id: string }[] }).regions.map(region => region.id)).toContain('ca-central-1');
+
+    const unsafe = await request('/api/genesys/regions', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ regions: [{ id: 'unsafe-1', name: 'Unsafe', api: 'https://api.attacker.test', oauth: 'https://login.attacker.test' }] }),
+    }, true);
+    expect(unsafe.status).toBe(400);
+
+    const updateExisting = await request('/api/genesys/regions', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ regions: originalRegions.map(region => region.id === 'ap-southeast-1' ? { ...region, name: 'Singapore Region' } : region).concat({ id: 'ca-central-1', name: 'Canada Central', api: 'https://api.cac1.pure.cloud', oauth: 'https://login.cac1.pure.cloud' }) }),
+    }, true);
+    expect(updateExisting.status).toBe(200);
+    expect((await updateExisting.json() as { regions: { id: string; name: string }[] }).regions.find(region => region.id === 'ap-southeast-1')?.name).toBe('Singapore Region');
+
+    const removeAdded = await request('/api/genesys/regions', {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ regions: originalRegions }),
+    }, true);
+    expect(removeAdded.status).toBe(200);
+  });
 
   it('limits the analytics interval and labels synthetic metadata as non-playable', async () => {
     const tooWide = await request('/api/recordings/search', {
@@ -222,6 +259,12 @@ describe('HTTP API security and Mock Mode flows', () => {
     const viewerAuth = await viewerLogin.json() as { csrfToken: string };
     const viewerAdminPage = await fetch(`${baseUrl}/api/admin/users`, { headers: { Cookie: viewerCookie } });
     expect(viewerAdminPage.status).toBe(403);
+    const viewerRegionUpdate = await fetch(`${baseUrl}/api/genesys/regions`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', Cookie: viewerCookie, 'x-csrf-token': viewerAuth.csrfToken, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({ regions: [] }),
+    });
+    expect(viewerRegionUpdate.status).toBe(403);
 
     const disable = await request(`/api/admin/users/${created.id}/enabled`, {
       method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: false }),

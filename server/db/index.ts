@@ -14,4 +14,10 @@ export function migrate() {
   const sourceSchema = path.resolve('server/db/schema.sql');
   const schemaPath = fs.existsSync(builtSchema) ? builtSchema : sourceSchema;
   db.exec(fs.readFileSync(schemaPath, 'utf8'));
+  db.prepare(`UPDATE connections
+    SET api_base_url='https://api.apse1.pure.cloud', oauth_base_url='https://login.apse1.pure.cloud',
+        last_success_at=NULL, last_error=NULL, updated_at=?
+    WHERE region_id='ap-southeast-1'
+      AND api_base_url='https://api.mypurecloud.com.sg'
+      AND oauth_base_url='https://login.mypurecloud.com.sg'`).run(new Date().toISOString());
 }

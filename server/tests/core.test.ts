@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { REGIONS, trustedBaseUrl } from '../regions.js';
+import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../regions.js';
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
@@ -9,18 +9,27 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   afterAll(() => { delete process.env.MASTER_ENCRYPTION_KEY; });
 
   it('provides official common Genesys regions including Singapore and Tokyo', () => {
-    expect(REGIONS.find(region => region.id === 'ap-southeast-1')?.api).toBe('https://api.mypurecloud.com.sg');
-    expect(REGIONS.find(region => region.id === 'ap-northeast-1')?.oauth).toBe('https://login.mypurecloud.jp');
-    expect(REGIONS.some(region => region.id === 'us-east-1')).toBe(true);
-    expect(REGIONS.some(region => region.id === 'us-west-2')).toBe(true);
-    expect(REGIONS.some(region => region.id === 'eu-west-1')).toBe(true);
+    expect(DEFAULT_REGIONS.find(region => region.id === 'ap-southeast-1')).toMatchObject({ api: 'https://api.apse1.pure.cloud', oauth: 'https://login.apse1.pure.cloud' });
+    expect(DEFAULT_REGIONS.find(region => region.id === 'ap-northeast-1')?.oauth).toBe('https://login.mypurecloud.jp');
+    expect(DEFAULT_REGIONS.some(region => region.id === 'us-east-1')).toBe(true);
+    expect(DEFAULT_REGIONS.some(region => region.id === 'us-west-2')).toBe(true);
+    expect(DEFAULT_REGIONS.some(region => region.id === 'eu-west-1')).toBe(true);
   });
 
   it('rejects endpoint URLs outside exact allowlisted host origins', () => {
-    expect(trustedBaseUrl('https://api.mypurecloud.com.sg', 'api')).toBe('https://api.mypurecloud.com.sg');
-    expect(() => trustedBaseUrl('https://api.mypurecloud.com.sg.attacker.test', 'api')).toThrow();
+    expect(trustedBaseUrl('https://api.apse1.pure.cloud', 'api')).toBe('https://api.apse1.pure.cloud');
+    expect(() => trustedBaseUrl('https://api.apse1.pure.cloud.attacker.test', 'api')).toThrow();
     expect(() => trustedBaseUrl('http://127.0.0.1', 'api')).toThrow();
-    expect(() => trustedBaseUrl('https://api.mypurecloud.com.sg/path', 'api')).toThrow();
+    expect(() => trustedBaseUrl('https://api.apse1.pure.cloud/path', 'api')).toThrow();
+  });
+
+  it('allows administrators to define only matching HTTPS Genesys Cloud regional endpoints', () => {
+    expect(validateRegionEndpoints('https://api.cac1.pure.cloud', 'https://login.cac1.pure.cloud')).toEqual({
+      api: 'https://api.cac1.pure.cloud', oauth: 'https://login.cac1.pure.cloud',
+    });
+    expect(() => validateRegionEndpoints('https://api.cac1.pure.cloud', 'https://login.apse1.pure.cloud')).toThrow(/matching official/i);
+    expect(() => validateRegionEndpoints('https://api.cac1.pure.cloud.attacker.test', 'https://login.cac1.pure.cloud.attacker.test')).toThrow(/matching official/i);
+    expect(() => validateRegionEndpoints('http://api.cac1.pure.cloud', 'https://login.cac1.pure.cloud')).toThrow(/HTTPS/i);
   });
 
   it('encrypts secrets with authenticated encryption and decrypts them', () => {
