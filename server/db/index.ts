@@ -28,6 +28,8 @@ export function migrate() {
   for (const [column, definition] of Object.entries(profileColumns)) {
     if (!userColumns.has(column)) db.exec(`ALTER TABLE users ADD COLUMN ${column} ${definition}`);
   }
+  const libraryScheduleColumns=new Set((db.prepare('PRAGMA table_info(library_schedules)').all() as {name:string}[]).map(column=>column.name));
+  if(!libraryScheduleColumns.has('run_time'))db.exec("ALTER TABLE library_schedules ADD COLUMN run_time TEXT NOT NULL DEFAULT '02:00'");
   db.prepare(`UPDATE connections
     SET api_base_url='https://api.apse1.pure.cloud', oauth_base_url='https://login.apse1.pure.cloud',
         last_success_at=NULL, last_error=NULL, updated_at=?

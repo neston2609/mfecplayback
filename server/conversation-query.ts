@@ -5,6 +5,15 @@ type AnalyticsQueryClient = {
 export const ANALYTICS_CONVERSATION_PAGE_SIZE = 100;
 export const MAX_ANALYTICS_CONVERSATIONS = 1000;
 const MAX_CONVERSATION_PAGES = MAX_ANALYTICS_CONVERSATIONS / ANALYTICS_CONVERSATION_PAGE_SIZE;
+export const VOICE_RECORDING_FILTERS = {
+  segmentFilters: [{
+    type: 'and',
+    predicates: [
+      { type: 'dimension', dimension: 'mediaType', operator: 'matches', value: 'voice' },
+      { type: 'dimension', dimension: 'recording', operator: 'matches', value: 'true' },
+    ],
+  }],
+};
 
 export async function queryAllConversations(
   client: AnalyticsQueryClient,

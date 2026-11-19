@@ -59,6 +59,7 @@ describe('HTTP API security and Mock Mode flows', () => {
         SESSION_SECRET: 'integration-test-session-secret-with-sufficient-entropy',
         MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 17).toString('base64'),
         DATABASE_PATH: path.join(testDirectory, 'integration.sqlite'),
+        LIBRARY_STORAGE_ROOT: path.join(testDirectory,'library-storage'),
         INITIAL_ADMIN_USERNAME: 'integration-admin', INITIAL_ADMIN_PASSWORD: 'Integration-Test-Password-456!',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -79,6 +80,8 @@ describe('HTTP API security and Mock Mode flows', () => {
   it('requires authentication, enforces login and CSRF, then returns explicitly synthetic results', async () => {
     const anonymous = await request('/api/genesys/connections');
     expect(anonymous.status).toBe(401);
+    expect((await request('/api/library')).status).toBe(401);
+    expect((await request('/api/library/destinations')).status).toBe(401);
     const badLogin = await request('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'integration-admin', password: 'wrong password' }) });
     expect(badLogin.status).toBe(401);
     const login = await request('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'integration-admin', password: 'Integration-Test-Password-456!' }) });
@@ -94,6 +97,25 @@ describe('HTTP API security and Mock Mode flows', () => {
     const listedConnections = await mockConnections.json() as { connections: { id: string; mock?: boolean }[] };
     expect(listedConnections.connections).toHaveLength(1);
     expect(listedConnections.connections[0]).toMatchObject({ id: 'mock', mock: true });
+
+    const destinations=await request('/api/library/destinations');
+    expect(destinations.status).toBe(200);
+    expect(await destinations.json()).toMatchObject({destinations:[]});
+    const schedules=await request('/api/library/schedules');
+    expect(schedules.status).toBe(200);
+    expect(await schedules.json()).toMatchObject({schedules:[]});
+    const archivedLibrary=await request('/api/library');
+    expect(archivedLibrary.status).toBe(200);
+    expect(await archivedLibrary.json()).toMatchObject({items:[],total:0,page:1,pageSize:25});
+    const destinationWithoutCsrf=await request('/api/library/destinations',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Local',type:'local',path:'/tmp/library'})});
+    expect(destinationWithoutCsrf.status).toBe(403);
+    const savedDestination=await request('/api/library/destinations',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Integration archive',type:'local',path:path.join(testDirectory,'library-storage'),retentionDays:30})},true);
+    expect(savedDestination.status).toBe(201);
+    const savedDestinationBody=await savedDestination.json() as {destination:Record<string,unknown>};
+    expect(savedDestinationBody.destination).toMatchObject({name:'Integration archive',type:'local',retentionDays:30});
+    expect(savedDestinationBody.destination).not.toHaveProperty('password');
+    const mockSchedule=await request('/api/library/schedules',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Backfill',connectionId:'00000000-0000-4000-8000-000000000001',destinationId:'00000000-0000-4000-8000-000000000002',cadence:'daily',runTime:'02:00',timeZone:'Asia/Bangkok'})},true);
+    expect(mockSchedule.status).toBe(409);
 
     const noCsrf = await request('/api/recordings/search', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     expect(noCsrf.status).toBe(403);
@@ -141,8 +163,8 @@ describe('HTTP API security and Mock Mode flows', () => {
     }, true);
     expect(missingRecording.status).toBe(200);
     const allConversations = await missingRecording.json() as { results: { recordingCount: number; recordings: {mediaType:string}[] }[]; pageSize: number };
-    expect(allConversations.results).toHaveLength(4);
-    expect(allConversations.results.some(row => row.recordingCount === 0)).toBe(true);
+    expect(allConversations.results).toHaveLength(3);
+    expect(allConversations.results.every(row => row.recordingCount > 0)).toBe(true);
     expect(allConversations.results.flatMap(row=>row.recordings).every(recording=>recording.mediaType==='voice')).toBe(true);
   });
 
@@ -164,6 +186,7 @@ describe('HTTP API security and Mock Mode flows', () => {
           SESSION_SECRET: 'live-integration-test-session-secret-with-sufficient-entropy',
           MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 23).toString('base64'),
           DATABASE_PATH: path.join(liveDirectory, 'integration.sqlite'),
+          LIBRARY_STORAGE_ROOT:path.join(liveDirectory,'library'),
           INITIAL_ADMIN_USERNAME: 'live-integration-admin', INITIAL_ADMIN_PASSWORD: 'Live-Integration-Password-456!',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -184,7 +207,7 @@ describe('HTTP API security and Mock Mode flows', () => {
       liveCookie = (login.headers.get('set-cookie') || '').split(';', 1)[0];
       liveCsrf = (await login.json() as { csrfToken: string }).csrfToken;
 
-      const create = await fetch(`${liveUrl}/api/genesys/connections`, {
+    const create = await fetch(`${liveUrl}/api/genesys/connections`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', cookie: liveCookie, 'x-csrf-token': liveCsrf, Origin: 'http://localhost:5173' },
         body: JSON.stringify({
@@ -193,6 +216,8 @@ describe('HTTP API security and Mock Mode flows', () => {
         }),
       });
       expect(create.status).toBe(201);
+      const deniedLibraryConfiguration=await fetch(`${liveUrl}/api/library/destinations`,{method:'POST',headers:{'content-type':'application/json',cookie:liveCookie,Origin:'http://localhost:5173'},body:JSON.stringify({name:'Blocked local',type:'local',path:path.join(liveDirectory,'library'),retentionDays:30})});
+      expect(deniedLibraryConfiguration.status).toBe(403);
 
       const list = await fetch(`${liveUrl}/api/genesys/connections`, { headers: { cookie: liveCookie } });
       expect(list.status).toBe(200);

@@ -4,8 +4,9 @@ import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../reg
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
-import { queryAllConversations } from '../conversation-query.js';
-import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, recordingMediaRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
+import { queryAllConversations, VOICE_RECORDING_FILTERS } from '../conversation-query.js';
+import { participantLines, summarizeConversation } from '../conversation-summary.js';
+import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceInteraction, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaRequestPath, recordingMetadataRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from '../wrapup.js';
@@ -39,6 +40,82 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(result.conversations).toHaveLength(101);
     expect(result.conversations.at(-1)?.conversationId).toBe('conversation-101');
     expect(result).toMatchObject({ totalHits: 101, partial: false });
+  });
+
+  it('always adds the native Genesys voice-and-recording Analytics predicates', async () => {
+    let query:any;
+    await queryAllConversations({async post<T>(_path:string,body:any){query=body;return {conversations:[]} as T;}},'2026-11-18T00:00:00.000Z/2026-11-19T00:00:00.000Z',VOICE_RECORDING_FILTERS);
+    expect(query.segmentFilters).toEqual([{type:'and',predicates:[
+      {type:'dimension',dimension:'mediaType',operator:'matches',value:'voice'},
+      {type:'dimension',dimension:'recording',operator:'matches',value:'true'},
+    ]}]);
+  });
+
+  it('uses recordingmetadata first and exposes only verified voice recording IDs', async () => {
+    const conversation={participants:[{purpose:'customer',sessions:[{mediaType:'voice'}]}]};
+    const requested:string[]=[];
+    const client={async get<T>(endpoint:string):Promise<T>{requested.push(endpoint);return [
+      {recordingId:'voice-1',media:'audio',mediaType:'voice'},
+      {recordingId:'message-1',media:'message',mediaType:'message'},
+      {recordingId:'duplicate-1',media:'audio',mediaType:'voice'},
+      {recordingId:'duplicate-1',media:'audio',mediaType:'voice'},
+      {recordingId:'legacy-voice',startTime:'2026-11-18T00:00:00.000Z'},
+    ] as T;}};
+    expect(recordingMetadataRequestPath('id/with slash')).toBe('/api/v2/conversations/id%2Fwith%20slash/recordingmetadata');
+    await expect(listVoiceRecordings(client,'conversation',conversation)).resolves.toEqual([
+      {recordingId:'voice-1',media:'audio',mediaType:'voice'},
+      {recordingId:'duplicate-1',media:'audio',mediaType:'voice'},
+      {recordingId:'legacy-voice',startTime:'2026-11-18T00:00:00.000Z'},
+    ]);
+    expect(requested).toEqual(['/api/v2/conversations/conversation/recordingmetadata']);
+    expect(isVoiceInteraction(conversation)).toBe(true);
+    expect(isVoiceInteraction({participants:[{sessions:[{mediaType:'chat'}]}]})).toBe(false);
+  });
+
+  it('falls back to the conversation recordings endpoint only when recordingmetadata is unavailable', async () => {
+    const requested:string[]=[];
+    const client={async get<T>(endpoint:string):Promise<T>{requested.push(endpoint);if(endpoint.endsWith('/recordingmetadata'))throw Object.assign(new Error('Not found'),{status:404});return [{id:'fallback-voice',media:'audio',mediaType:'voice'}] as T;}};
+    await expect(listVoiceRecordings(client,'conversation',{participants:[{sessions:[{mediaType:'voice'}]}]})).resolves.toMatchObject([{id:'fallback-voice'}]);
+    expect(requested).toEqual(['/api/v2/conversations/conversation/recordingmetadata','/api/v2/conversations/conversation/recordings']);
+  });
+
+  it('summarizes UUID participants using names and hides SIP route strings from phone fields', () => {
+    const result=summarizeConversation({
+      conversationId:'conversation',conversationStart:'2026-11-19T00:00:00.000Z',conversationEnd:'2026-11-19T00:01:00.000Z',originatingDirection:'outbound',
+      participants:[
+        {purpose:'customer',sessions:[{ani:'sip:6aad58139624088f1a49d141+mfecpubliccompanylimited.orgspan.com@localhost',dnis:'tel:+6621234567',mediaType:'callback'}]},
+        {purpose:'agent',participantName:'eb13c121-2f73-4f10-b8da-3a550b0b4d29',userId:'eb13c121-2f73-4f10-b8da-3a550b0b4d29',sessions:[{mediaType:'callback',ani:'sip:route@localhost'}]},
+      ],
+    },{'eb13c121-2f73-4f10-b8da-3a550b0b4d29':'Nicha Agent'});
+
+    expect(result).toMatchObject({agents:['Nicha Agent'],flows:[],ani:'',dnis:'+6621234567',direction:'outbound',interactionType:'Human Agent'});
+  });
+
+  it('formats participant labels in Genesys order using customer numbers, flow names, and resolved agent names', () => {
+    const participants=[
+      {purpose:'customer',participantName:'Mobile Number, Thailand',sessions:[{ani:'tel:+66652936493',dnis:'tel:+6625440862'}]},
+      {purpose:'ivr',participantName:'[MAIN] - Bank of MFEC',sessions:[{flow:{flowName:'[MAIN] - Bank of MFEC'}}]},
+      {purpose:'ivr',participantName:'MFEC Insurance Call Flow',sessions:[{flow:{flowName:'MFEC Insurance Call Flow'}}]},
+      {purpose:'botflow',sessions:[{flow:{flowName:'MFEC_Insure_AVA'}}]},
+      {purpose:'acd',participantName:'MFEC_Insure_CSR'},
+      {purpose:'agent',userId:'agent-1',participantName:'agent-1'},
+    ];
+    expect(participantLines(participants,{'agent-1':'Suwajchai Rasikawan'}).map(item=>item.displayText)).toEqual([
+      'Customer : +66652936493 -> +6625440862',
+      'IVR : [MAIN] - Bank of MFEC',
+      'IVR : MFEC Insurance Call Flow',
+      'Botflow : MFEC_Insure_AVA',
+      'ACD : MFEC_Insure_CSR',
+      'Agent : Suwajchai Rasikawan',
+    ]);
+  });
+
+  it('recognizes Genesys audio recordings when their mediaType is missing or callback', () => {
+    const conversation={participants:[{purpose:'customer',sessions:[{mediaType:'callback'}]}]};
+    expect(isVoiceRecording({media:'audio'},conversation)).toBe(true);
+    expect(isVoiceRecording({media:'audio',mediaType:'callback'},conversation)).toBe(true);
+    expect(isVoiceRecording({media:'message'},conversation)).toBe(false);
+    expect(isVoiceRecording({media:'audio',mediaType:'callback'},{participants:[]})).toBe(true);
   });
 
   it('enforces the requested eight-character password rules without requiring both cases', () => {
@@ -147,6 +224,30 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     }
   });
 
+  it('honors Genesys 429 Retry-After and suppresses follow-up requests during the cooldown', async () => {
+    const originalFetch=globalThis.fetch,originalMode=process.env.MOCK_MODE;process.env.MOCK_MODE='false';
+    const apiCalls:string[]=[];
+    globalThis.fetch=(async(input:RequestInfo|URL)=>{const url=String(input);if(url.endsWith('/oauth/token'))return new Response(JSON.stringify({access_token:'limited-token',expires_in:300}),{status:200,headers:{'content-type':'application/json'}});apiCalls.push(url);return new Response('rate limited',{status:429,headers:{'retry-after':'30'}});}) as typeof fetch;
+    const client=new GenesysClient({id:`rate-limit-${crypto.randomUUID()}`,name:'Rate limit',organization_label:'test',region_id:'us-east-1',api_base_url:'https://api.mypurecloud.com',oauth_base_url:'https://login.mypurecloud.com',client_id:'client',client_secret_enc:encrypt('secret'),enabled:1,is_default:0});
+    try{
+      await expect(client.get('/api/v2/organizations/me')).rejects.toMatchObject({status:429,retryAfterMs:30000});
+      await expect(client.get('/api/v2/conversations/next/recordings')).rejects.toMatchObject({status:429});
+      expect(apiCalls).toHaveLength(1);
+    }finally{client.clearCachedToken();globalThis.fetch=originalFetch;if(originalMode===undefined)delete process.env.MOCK_MODE;else process.env.MOCK_MODE=originalMode;}
+  });
+
+  it('applies the same cooldown when Genesys OAuth itself returns 429', async () => {
+    const originalFetch=globalThis.fetch,originalMode=process.env.MOCK_MODE;process.env.MOCK_MODE='false';
+    let oauthCalls=0;
+    globalThis.fetch=(async()=>{oauthCalls++;return new Response('rate limited',{status:429,headers:{'retry-after':'20'}});}) as typeof fetch;
+    const client=new GenesysClient({id:`oauth-rate-limit-${crypto.randomUUID()}`,name:'OAuth rate limit',organization_label:'test',region_id:'us-east-1',api_base_url:'https://api.mypurecloud.com',oauth_base_url:'https://login.mypurecloud.com',client_id:'client',client_secret_enc:encrypt('secret'),enabled:1,is_default:0});
+    try{
+      await expect(client.get('/api/v2/organizations/me')).rejects.toMatchObject({status:429,retryAfterMs:20000});
+      await expect(client.get('/api/v2/organizations/me')).rejects.toMatchObject({status:429});
+      expect(oauthCalls).toBe(1);
+    }finally{client.clearCachedToken();globalThis.fetch=originalFetch;if(originalMode===undefined)delete process.env.MOCK_MODE;else process.env.MOCK_MODE=originalMode;}
+  });
+
   it('requests downloadable Genesys recording media and waits for asynchronous readiness', async () => {
     const path = recordingMediaRequestPath('conversation id', 'recording/id');
     expect(path).toBe('/api/v2/conversations/conversation%20id/recordings/recording%2Fid?formatId=WEBM&download=true');
@@ -159,12 +260,12 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     const result = await getRecordingMedia(client, 'conversation', 'recording', async () => undefined);
     expect(requested).toHaveLength(4);
     expect(requested[1]).toBe('/api/v2/conversations/conversation/recordings');
-    expect(requested.filter(endpoint => endpoint.includes('/recordings/recording?')).every(endpoint => endpoint.includes('download=true'))).toBe(true);
+    expect(requested.filter(endpoint => endpoint.includes('/recordings/recording?')).every(endpoint => endpoint.includes('formatId=WEBM'))).toBe(true);
     expect(result?.mediaUri).toContain('X-Amz-Signature=sig');
     let attempts = 0;
     const unavailableClient = { async get<T>(): Promise<T> { attempts++; return undefined as T; } };
     expect(await getRecordingMedia(unavailableClient, 'conversation', 'pending', async () => undefined)).toBeUndefined();
-    expect(attempts).toBe(9);
+    expect(attempts).toBe(8);
   });
 
   it('uses the media URI from the matching recording list item when detail metadata has none', async () => {
@@ -182,6 +283,19 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     ]);
     expect(result?.metadata.id).toBe('wanted-recording');
     expect(result?.mediaUri).toContain('X-Amz-Signature=sig');
+  });
+
+  it('does not attempt archive restoration for an AVAILABLE recording with no media URI', async () => {
+    const requested: string[] = [];
+    const recording = { id: 'available-recording', media: 'audio', fileState: 'AVAILABLE', mediaUris: {} };
+    const client = { async get<T>(endpoint: string): Promise<T> {
+      requested.push(endpoint);
+      return (endpoint.endsWith('/recordings') ? [recording] : recording) as T;
+    } };
+
+    await expect(getRecordingMedia(client, 'conversation', recording.id, async () => undefined)).resolves.toBeUndefined();
+    expect(requested.some(endpoint => endpoint.endsWith('/restore'))).toBe(false);
+    expect(requested).toHaveLength(8);
   });
 
   it('allows only signed Genesys recording storage URLs and known regional media hosts', () => {

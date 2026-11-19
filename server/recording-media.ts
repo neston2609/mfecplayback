@@ -7,6 +7,45 @@ export function recordingMediaRequestPath(conversationId: string, recordingId: s
   return `/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings/${encodeURIComponent(recordingId)}?${query}`;
 }
 
+export function recordingMetadataRequestPath(conversationId: string): string {
+  return `/api/v2/conversations/${encodeURIComponent(conversationId)}/recordingmetadata`;
+}
+
+export function isVoiceInteraction(conversation: any): boolean {
+  if (typeof conversation?.mediaStats?.voice === 'number' || typeof conversation?.mediaStats?.callback === 'number') return true;
+  return conversationHasVoiceSession(conversation);
+}
+
+export async function listVoiceRecordings(client: RecordingMetadataClient, conversationId: string, conversation?: any) {
+  let items: any[] = [];
+  try {
+    const response = await client.get<any>(recordingMetadataRequestPath(conversationId));
+    items = Array.isArray(response) ? response
+      : Array.isArray(response?.recordings) ? response.recordings
+      : Array.isArray(response?.recordingMetadata) ? response.recordingMetadata
+      : Array.isArray(response?.entities) ? response.entities : [];
+  } catch (error) {
+    // Older org permissions may deny recordingmetadata while permitting the
+    // recordings collection endpoint. Fall back only for endpoint availability.
+    const status = (error as { status?: number })?.status;
+    if (status !== 403 && status !== 404 && status !== 405) throw error;
+    const response = await client.get<any>(`/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings`);
+    items = Array.isArray(response) ? response
+      : Array.isArray(response?.recordings) ? response.recordings
+      : Array.isArray(response?.recordingMetadata) ? response.recordingMetadata
+      : Array.isArray(response?.entities) ? response.entities : [];
+  }
+  const ids = new Set<string>();
+  return items.filter((recording: any) => {
+    const id = String(recording?.id || recording?.recordingId || '');
+    const hasUnspecifiedMediaType=!recording?.mediaType&&!recording?.media;
+    const verifiedVoice=isVoiceRecording(recording,conversation)||(hasUnspecifiedMediaType&&isVoiceInteraction(conversation));
+    if (!id || ids.has(id) || isMessageRecording(recording) || !verifiedVoice) return false;
+    ids.add(id);
+    return true;
+  });
+}
+
 export function recordingMediaUri(metadata: any): string | undefined {
   const mediaUris = metadata?.mediaUris;
   if (Array.isArray(mediaUris)) {
@@ -23,23 +62,32 @@ export function isZipMediaContentType(contentType: string | null | undefined): b
 }
 
 export function isMessageRecording(metadata: any): boolean {
-  return metadata?.media === 'message' || metadata?.media === 'chat' || metadata?.media === 'email';
+  const media = typeof metadata?.media === 'string' ? metadata.media.trim().toLowerCase() : '';
+  const mediaType = typeof metadata?.mediaType === 'string' ? metadata.mediaType.trim().toLowerCase() : '';
+  return ['message', 'chat', 'email'].includes(media) || ['message', 'chat', 'email'].includes(mediaType);
 }
 
 export function conversationHasVoiceSession(conversation: any): boolean {
   return Array.isArray(conversation?.participants) && conversation.participants.some((participant: any) =>
     Array.isArray(participant?.sessions) && participant.sessions.some((session: any) =>
-      typeof session?.mediaType === 'string' && session.mediaType.trim().toLowerCase() === 'voice',
+      typeof session?.mediaType === 'string' && ['voice', 'callback'].includes(session.mediaType.trim().toLowerCase()),
     ),
   );
 }
 
 export function isVoiceRecording(recording: any, conversation?: any): boolean {
   if (isMessageRecording(recording)) return false;
-  if (typeof recording?.mediaType === 'string') return recording.mediaType.trim().toLowerCase() === 'voice';
-  // Genesys recording metadata identifies voice recordings as `media: audio`;
-  // the associated Analytics conversation identifies the channel as `mediaType: voice`.
-  return typeof recording?.media === 'string' && recording.media.trim().toLowerCase() === 'audio' && conversationHasVoiceSession(conversation);
+  const mediaType = typeof recording?.mediaType === 'string' ? recording.mediaType.trim().toLowerCase() : '';
+  const media = typeof recording?.media === 'string' ? recording.media.trim().toLowerCase() : '';
+  if (mediaType === 'voice') return true;
+  // Genesys may report callback recordings as `mediaType: callback`, while the
+  // recording itself is still audio. Callback sessions are voice interactions.
+  if (mediaType === 'callback' && (media === 'audio' || conversationHasVoiceSession(conversation))) return true;
+  if (['voice','audio'].includes(mediaType) && conversationHasVoiceSession(conversation)) return true;
+  if (media === 'voice' && conversationHasVoiceSession(conversation)) return true;
+  // Legacy recording metadata omits mediaType; use its audio media class and
+  // conversation context (voice or callback) rather than dropping the item.
+  return media === 'audio' && conversationHasVoiceSession(conversation);
 }
 
 export async function getRecordingMedia(
@@ -50,14 +98,16 @@ export async function getRecordingMedia(
 ) {
   const path = recordingMediaRequestPath(conversationId, recordingId);
   const listPath = `/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings`;
-  for (let attempt = 0; attempt < 8; attempt++) {
+  const delays = [0, 750, 1500, 3000, 6000, 12000];
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (attempt > 0) await wait(delays[attempt]);
     const metadata = await client.get<any>(path);
     const mediaUri = recordingMediaUri(metadata);
     if (mediaUri) return { metadata, mediaUri };
     // Genesys may return a media URI on the conversation recording list while
     // the individual recording download metadata omits it. Match the recording
     // ID exactly and never borrow another recording's media URI.
-    if (attempt === 0) {
+    if (attempt === 0 || attempt === 3) {
       const recordings = await client.get<any>(listPath);
       const listed = Array.isArray(recordings)
         ? recordings.find((recording: any) => (recording?.id || recording?.recordingId) === recordingId)
@@ -65,7 +115,6 @@ export async function getRecordingMedia(
       const listedMediaUri = recordingMediaUri(listed);
       if (listed && listedMediaUri) return { metadata: listed, mediaUri: listedMediaUri };
     }
-    if (attempt < 7) await wait(750 * (attempt + 1));
   }
   return undefined;
 }
