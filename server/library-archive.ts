@@ -57,7 +57,7 @@ async function getMediaBytes(client:GenesysClient,connection:Connection,conversa
 }
 
 export class LibraryArchiveWorker {
-  private timer:NodeJS.Timeout|undefined;private running=false;private activeScheduleId:string|undefined;
+  private timer:NodeJS.Timeout|undefined;private running=false;private rerunRequested=false;private activeScheduleId:string|undefined;
   constructor(private readonly deps:ArchiveDeps={}){}
   start(){if(this.timer)return;this.timer=setInterval(()=>void this.tick(),30000);this.timer.unref();void this.tick();}
   stop(){if(this.timer)clearInterval(this.timer);this.timer=undefined;}
@@ -69,14 +69,32 @@ export class LibraryArchiveWorker {
     const state=isArchiving?'archiving':hasQueued?'queued':hasFailed?'failed':'idle';
     return {state,checkedAt:this.now().toISOString(),schedules:schedules.map(({run_requested,...schedule})=>({...schedule,run_status:this.activeScheduleId===schedule.id?'running':Number(schedule.pending_count)>0?'queued':Number(schedule.failed_count)>0?'failed':schedule.run_status==='running'?'idle':schedule.run_status}))};
   }
-  async tick(){if(this.running)return;this.running=true;try{this.purgeExpired().catch(()=>{});const schedules=db.prepare("SELECT * FROM library_schedules WHERE enabled=1 OR run_requested=1 ORDER BY created_at").all() as Schedule[];for(const schedule of schedules){this.activeScheduleId=schedule.id;try{await this.runSchedule(schedule);}catch(error){const limited=error instanceof GenesysError&&error.status===429;db.prepare("UPDATE library_schedules SET run_status=?,run_requested=CASE WHEN ? THEN run_requested ELSE 0 END,last_error=?,updated_at=? WHERE id=?").run(limited?'queued':'failed',Number(limited),safeError(error),this.now().toISOString(),schedule.id);if(limited)break;}finally{this.activeScheduleId=undefined;}}}finally{this.activeScheduleId=undefined;this.running=false;}}
+  async tick(){if(this.running){this.rerunRequested=true;return;}this.running=true;try{this.purgeExpired().catch(()=>{});const schedules=db.prepare("SELECT * FROM library_schedules WHERE enabled=1 OR run_requested=1 ORDER BY created_at").all() as Schedule[];for(const schedule of schedules){this.activeScheduleId=schedule.id;try{await this.runSchedule(schedule);}catch(error){const limited=error instanceof GenesysError&&error.status===429;db.prepare("UPDATE library_schedules SET run_status=?,run_requested=CASE WHEN ? THEN run_requested ELSE 0 END,last_error=?,updated_at=? WHERE id=?").run(limited?'queued':'failed',Number(limited),safeError(error),this.now().toISOString(),schedule.id);if(limited)break;}finally{this.activeScheduleId=undefined;}}}finally{this.activeScheduleId=undefined;this.running=false;if(this.rerunRequested){this.rerunRequested=false;setImmediate(()=>void this.tick());}}}
   private now(){return this.deps.now?.()||new Date();}
   private async runSchedule(schedule:Schedule){
     const now=this.now();
+    const manualRun=Number(schedule.run_requested)===1;
+    db.prepare("UPDATE library_schedules SET run_status='running',last_started_at=?,last_error=NULL,updated_at=? WHERE id=?").run(now.toISOString(),now.toISOString(),schedule.id);
+    // A manual run should produce recent recordings first, rather than making
+    // the user wait for the entire 550-day initial backfill to reach today.
+    if(manualRun){
+      try{await this.enqueueRecentWindow(schedule,now);}
+      catch(error){
+        if(error instanceof GenesysError&&error.status===429)throw error;
+        db.prepare("UPDATE library_schedules SET run_requested=0 WHERE id=?").run(schedule.id);
+        throw error;
+      }
+      db.prepare("UPDATE library_schedules SET run_requested=0 WHERE id=?").run(schedule.id);
+    }
     const due=Date.parse(schedule.next_run_at)<=now.getTime();
-    if(!schedule.backfill_complete||due){await this.enqueueWindows(schedule,now);}
-    const pending=db.prepare("SELECT * FROM library_archive_queue WHERE schedule_id=? AND status='pending' AND attempts<5 ORDER BY conversation_start,id LIMIT ?").all(schedule.id,ITEMS_PER_TICK) as QueueItem[];
-    if(pending.length){db.prepare("UPDATE library_schedules SET run_status='running',last_started_at=?,last_error=NULL,updated_at=? WHERE id=?").run(now.toISOString(),now.toISOString(),schedule.id);for(const item of pending){await this.archiveConversation(schedule,item);}}
+    if(!manualRun&&(!schedule.backfill_complete||due)){await this.enqueueWindows(schedule,now);}
+    let pending:QueueItem[]=[];
+    if(manualRun){
+      const recentStart=new Date(now.getTime()-DAY).toISOString();
+      pending=db.prepare("SELECT * FROM library_archive_queue WHERE schedule_id=? AND status='pending' AND attempts<5 AND conversation_start>=? ORDER BY conversation_start DESC,id DESC LIMIT ?").all(schedule.id,recentStart,ITEMS_PER_TICK) as QueueItem[];
+    }
+    if(!pending.length)pending=db.prepare("SELECT * FROM library_archive_queue WHERE schedule_id=? AND status='pending' AND attempts<5 ORDER BY conversation_start DESC,id DESC LIMIT ?").all(schedule.id,ITEMS_PER_TICK) as QueueItem[];
+    for(const item of pending)await this.archiveConversation(schedule,item);
     const stillPending=Number((db.prepare("SELECT COUNT(*) AS n FROM library_archive_queue WHERE schedule_id=? AND status='pending' AND attempts<5").get(schedule.id) as {n:number}).n);
     const refreshed=db.prepare('SELECT * FROM library_schedules WHERE id=?').get(schedule.id) as Schedule;
     if(!stillPending&&refreshed.backfill_complete&&Date.parse(refreshed.cursor_at)>=now.getTime()-60000){
@@ -91,16 +109,23 @@ export class LibraryArchiveWorker {
     let cursor=Date.parse(schedule.cursor_at);const earliest=Date.parse(initialArchiveCursor(now));if(!Number.isFinite(cursor)||cursor<earliest)cursor=earliest;
     const targetTime=now.getTime();
     for(let window=0;window<WINDOWS_PER_TICK&&cursor<targetTime;window++){
-      const end=Math.min(targetTime,cursor+DAY);const interval=`${new Date(cursor).toISOString()}/${new Date(end).toISOString()}`;
-      for(let page=1;page<=MAX_PAGES_PER_WINDOW;page++){
-        const result=await client.post<{conversations?:any[];totalHits?:number;totalCount?:number}>('/api/v2/analytics/conversations/details/query',{interval,paging:{pageSize:PAGE_SIZE,pageNumber:page},order:'asc',orderBy:'conversationStart',...VOICE_RECORDING_FILTERS});
-        const conversations=Array.isArray(result?.conversations)?result.conversations:[];
-        const insert=db.prepare("INSERT INTO library_archive_queue(schedule_id,conversation_id,conversation_start,status,created_at) VALUES(?,?,?,'pending',?) ON CONFLICT(schedule_id,conversation_id) DO NOTHING");
-        const transaction=db.transaction(()=>{for(const conversation of conversations){if(!conversation?.conversationId)continue;const start=Date.parse(conversation.conversationStart);if(Number.isFinite(start)&&start>=cursor&&start<end)insert.run(schedule.id,String(conversation.conversationId).slice(0,128),new Date(start).toISOString(),now.toISOString());}});transaction();
-        const total=result?.totalHits??result?.totalCount;if(!conversations.length||conversations.length<PAGE_SIZE||(Number.isFinite(total)&&page*PAGE_SIZE>=Number(total)))break;
-        if(page===MAX_PAGES_PER_WINDOW)throw new Error(`Genesys returned more than ${PAGE_SIZE*MAX_PAGES_PER_WINDOW} conversations in one day. Reduce archive search density or use a separate connection; the cursor remains unchanged.`);
-      }
+      const end=Math.min(targetTime,cursor+DAY);await this.enqueueWindow(client,schedule,cursor,end,now);
       cursor=end;db.prepare("UPDATE library_schedules SET cursor_at=?,backfill_complete=?,run_status='queued',updated_at=? WHERE id=?").run(new Date(cursor).toISOString(),Number(cursor>=targetTime),now.toISOString(),schedule.id);
+    }
+  }
+  private async enqueueRecentWindow(schedule:Schedule,now:Date){
+    const end=now.getTime(),start=end-DAY,client=this.clientFor(schedule.connection_id);
+    await this.enqueueWindow(client,schedule,start,end,now);
+  }
+  private async enqueueWindow(client:GenesysClient,schedule:Schedule,start:number,end:number,now:Date){
+    const interval=`${new Date(start).toISOString()}/${new Date(end).toISOString()}`;
+    for(let page=1;page<=MAX_PAGES_PER_WINDOW;page++){
+      const result=await client.post<{conversations?:any[];totalHits?:number;totalCount?:number}>('/api/v2/analytics/conversations/details/query',{interval,paging:{pageSize:PAGE_SIZE,pageNumber:page},order:'asc',orderBy:'conversationStart',...VOICE_RECORDING_FILTERS});
+      const conversations=Array.isArray(result?.conversations)?result.conversations:[];
+      const insert=db.prepare("INSERT INTO library_archive_queue(schedule_id,conversation_id,conversation_start,status,created_at) VALUES(?,?,?,'pending',?) ON CONFLICT(schedule_id,conversation_id) DO NOTHING");
+      const transaction=db.transaction(()=>{for(const conversation of conversations){if(!conversation?.conversationId)continue;const conversationStart=Date.parse(conversation.conversationStart);if(Number.isFinite(conversationStart)&&conversationStart>=start&&conversationStart<end)insert.run(schedule.id,String(conversation.conversationId).slice(0,128),new Date(conversationStart).toISOString(),now.toISOString());}});transaction();
+      const total=result?.totalHits??result?.totalCount;if(!conversations.length||conversations.length<PAGE_SIZE||(Number.isFinite(total)&&page*PAGE_SIZE>=Number(total)))break;
+      if(page===MAX_PAGES_PER_WINDOW)throw new Error(`Genesys returned more than ${PAGE_SIZE*MAX_PAGES_PER_WINDOW} conversations in one day. Reduce archive search density or use a separate connection; the cursor remains unchanged.`);
     }
   }
   private clientFor(connectionId:string){const row=db.prepare('SELECT * FROM connections WHERE id=? AND enabled=1').get(connectionId) as Connection|undefined;if(!row)throw new Error('The scheduled Genesys connection is unavailable or disabled.');const user=db.prepare("SELECT id,role FROM users WHERE enabled=1 AND role='administrator' ORDER BY created_at LIMIT 1").get() as {id:string;role:string}|undefined;if(!user)throw new Error('No enabled administrator is available to authorize the archive connection.');const connection=connectionById(row.id,user.id,user.role);return this.deps.clientFor?.(connection)||new GenesysClient(connection);}

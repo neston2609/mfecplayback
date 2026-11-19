@@ -90,6 +90,7 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect((await request('/api/library')).status).toBe(401);
     expect((await request('/api/library/destinations')).status).toBe(401);
     expect((await request('/api/library/worker-status')).status).toBe(401);
+    expect((await request('/api/playback-history')).status).toBe(401);
     expect((await request('/api/recordings/conversations/demo-ava-agent-001/summaries?connectionId=mock')).status).toBe(401);
     expect((await request('/api/recordings/conversations/demo-ava-agent-001/transcription?connectionId=mock')).status).toBe(401);
     const badLogin = await request('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'integration-admin', password: 'wrong password' }) });
@@ -101,6 +102,19 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(cookie).toContain('mfec.recording.sid=');
     const auth = await login.json() as { csrfToken: string };
     csrf = auth.csrfToken;
+    const playbackDb=new Database(integrationDatabasePath);
+    const adminId=String((playbackDb.prepare("SELECT id FROM users WHERE username='integration-admin'").get() as {id:string}).id),playedAt=new Date().toISOString();
+    playbackDb.prepare('INSERT INTO audit_logs(user_id,username,action,result,connection_id,conversation_id,recording_id,created_at) VALUES(?,?,?,?,?,?,?,?)').run(adminId,'integration-admin','PLAYBACK','SUCCESS','history-connection','history-conversation','history-recording',playedAt);
+    playbackDb.prepare('INSERT INTO audit_logs(user_id,username,action,result,created_at) VALUES(?,?,?,?,?)').run(adminId,'integration-admin','LIBRARY_PLAYBACK','SUCCESS',playedAt);
+    playbackDb.prepare('INSERT INTO audit_logs(user_id,username,action,result,created_at) VALUES(?,?,?,?,?)').run(adminId,'integration-admin','LOGIN','SUCCESS',playedAt);
+    playbackDb.prepare('INSERT INTO audit_logs(user_id,username,action,result,created_at) VALUES(?,?,?,?,?)').run('another-user-id','another-user','PLAYBACK','SUCCESS',playedAt);
+    playbackDb.close();
+    expect((await request('/api/playback-history')).status).toBe(200);
+    const playbackHistory=await (await request('/api/playback-history')).json() as {items:{action:string;result:string;connectionId:string|null;conversationId:string|null;recordingId:string|null}[]};
+    expect(playbackHistory.items).toHaveLength(2);
+    expect(playbackHistory.items.map(item=>item.action)).toEqual(['LIBRARY_PLAYBACK','PLAYBACK']);
+    expect(playbackHistory.items.some(item=>item.connectionId==='another-user-id')).toBe(false);
+    expect(playbackHistory.items[1]).toMatchObject({result:'SUCCESS',connectionId:'history-connection',conversationId:'history-conversation',recordingId:'history-recording'});
 
     const mockConnections = await request('/api/genesys/connections');
     expect(mockConnections.status).toBe(200);
@@ -162,7 +176,10 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(runNow.status).toBe(200);
     expect(await runNow.json()).toMatchObject({ok:true,queued:true});
     const verifyDb=new Database(integrationDatabasePath,{readonly:true});
-    expect(verifyDb.prepare('SELECT enabled,run_requested,run_status FROM library_schedules WHERE id=?').get(scheduleId)).toMatchObject({enabled:0,run_requested:0,run_status:'failed'});
+    expect(verifyDb.prepare('SELECT enabled,run_requested,run_status,last_started_at,last_error FROM library_schedules WHERE id=?').get(scheduleId)).toMatchObject({enabled:0,run_requested:0,run_status:'failed'});
+    const runResult=verifyDb.prepare('SELECT last_started_at,last_error FROM library_schedules WHERE id=?').get(scheduleId) as {last_started_at:string;last_error:string};
+    expect(runResult.last_started_at).toBeTruthy();
+    expect(runResult.last_error).toMatch(/Mock Mode/);
     verifyDb.close();
     const workerAfterRun=await (await request('/api/library/worker-status')).json() as {state:string;schedules:{id:string;run_status:string;enabled:number;failed_count:number}[]};
     expect(workerAfterRun.state).toBe('failed');

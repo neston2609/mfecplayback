@@ -256,7 +256,7 @@ app.put('/api/library/schedules/:id',requireAuth,requireAdmin,requireCsrf,(req,r
   try{const id=String(req.params.id),existing=db.prepare('SELECT * FROM library_schedules WHERE id=?').get(id) as any;if(!existing)throw httpError(404,'Schedule not found.');const input=scheduleSchema.parse(req.body);const connection=connectionById(input.connectionId,req.session.user!.id,req.session.user!.role);if(!db.prepare('SELECT id FROM library_destinations WHERE id=?').get(input.destinationId))throw httpError(400,'Choose an existing destination.');const now=new Date(),nextRun=nextScheduleTime({cadence:input.cadence,day_of_week:input.dayOfWeek??null,day_of_month:input.dayOfMonth??null,run_time:input.runTime,time_zone:input.timeZone},now);db.prepare('UPDATE library_schedules SET name=?,connection_id=?,destination_id=?,cadence=?,day_of_week=?,day_of_month=?,run_time=?,time_zone=?,enabled=?,next_run_at=?,updated_at=? WHERE id=?').run(input.name,connection.id,input.destinationId,input.cadence,input.dayOfWeek??null,input.dayOfMonth??null,input.runTime,input.timeZone,Number(input.enabled),nextRun,now.toISOString(),id);audit(req,'LIBRARY_SCHEDULE_UPDATE','SUCCESS',connection.id,undefined,undefined,{scheduleId:id,enabled:input.enabled});void libraryArchiveWorker.tick();res.json({ok:true});}catch(error){next(error);}
 });
 app.post('/api/library/schedules/:id/retry',requireAuth,requireAdmin,requireCsrf,(req,res,next)=>{
-  try{const id=String(req.params.id);if(!db.prepare('SELECT id FROM library_schedules WHERE id=?').get(id))throw httpError(404,'Schedule not found.');const retried=retryFailedArchive(id);db.prepare("UPDATE library_schedules SET run_status='queued',last_error=NULL,updated_at=? WHERE id=?").run(new Date().toISOString(),id);audit(req,'LIBRARY_SCHEDULE_RETRY','SUCCESS',undefined,undefined,undefined,{scheduleId:id,retried});res.json({ok:true,retried});}catch(error){next(error);}
+  try{const id=String(req.params.id);if(!db.prepare('SELECT id FROM library_schedules WHERE id=?').get(id))throw httpError(404,'Schedule not found.');const retried=retryFailedArchive(id);db.prepare("UPDATE library_schedules SET run_status='queued',last_error=NULL,updated_at=? WHERE id=?").run(new Date().toISOString(),id);audit(req,'LIBRARY_SCHEDULE_RETRY','SUCCESS',undefined,undefined,undefined,{scheduleId:id,retried});void libraryArchiveWorker.tick();res.json({ok:true,retried});}catch(error){next(error);}
 });
 app.post('/api/library/schedules/:id/run-now',requireAuth,requireAdmin,requireCsrf,(req,res,next)=>{
   try{const id=String(req.params.id),now=new Date().toISOString();const result=db.prepare("UPDATE library_schedules SET run_requested=1,next_run_at=?,run_status='queued',last_error=NULL,updated_at=? WHERE id=?").run(now,now,id);if(!result.changes)throw httpError(404,'Schedule not found.');audit(req,'LIBRARY_SCHEDULE_RUN_NOW','SUCCESS',undefined,undefined,undefined,{scheduleId:id});void libraryArchiveWorker.tick();res.json({ok:true,queued:true});}catch(error){next(error);}
@@ -591,11 +591,12 @@ app.get('/api/recordings/conversations/:conversationId/transcription', requireAu
   } catch(error) { next(error); }
 });
 app.get('/api/recordings/:recordingId/stream', requireAuth, async (req,res,next) => {
+  let playbackConnection:Connection|undefined;
   try {
     const cId=String(req.query.connectionId||''), conversationId=String(req.query.conversationId||'');
     if(!conversationId||conversationId.length>128||String(req.params.recordingId).length>128)throw httpError(400,'Valid conversation and recording IDs are required.');
     if(cId==='mock'&&process.env.MOCK_MODE==='true') return res.status(501).json({error:'Synthetic demo recordings include metadata only; real audio playback requires an authorized Genesys recording.'});
-     const c=connectionById(cId,req.session.user!.id,req.session.user!.role); const client=new GenesysClient(c);
+     const c=connectionById(cId,req.session.user!.id,req.session.user!.role);playbackConnection=c; const client=new GenesysClient(c);
      const recordingId=String(req.params.recordingId),conversation=await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`);
      const voiceRecordings=await listVoiceRecordings(client,conversationId,conversation);
      if(!voiceRecordings.some(item=>String(item.id||item.recordingId)===recordingId))throw httpError(404,'Voice recording not found.');
@@ -618,7 +619,16 @@ app.get('/api/recordings/:recordingId/stream', requireAuth, async (req,res,next)
       await pipeMedia(req,res,media);
     }
     audit(req,'PLAYBACK','SUCCESS',c.id,conversationId,recordingId);
-  } catch(error) { if(!res.headersSent){audit(req,'PLAYBACK','FAILED',undefined,String(req.query.conversationId||''),String(req.params.recordingId||''));next(error);} }
+  } catch(error) { if(!res.headersSent){audit(req,'PLAYBACK','FAILED',playbackConnection?.id,String(req.query.conversationId||''),String(req.params.recordingId||''));next(error);} }
+});
+app.get('/api/playback-history',requireAuth,(req,res)=>{
+  const user=req.session.user!;
+  const requestedLimit=Number.parseInt(String(req.query.limit||'50'),10);
+  const limit=Math.min(100,Math.max(1,Number.isFinite(requestedLimit)?requestedLimit:50));
+  const access=user.role==='administrator'?'':` AND (a.connection_id IS NULL OR a.connection_id IN (SELECT connection_id FROM user_connection_access WHERE user_id=?))`;
+  const values:unknown[]=user.role==='administrator'?[user.id,limit]:[user.id,user.id,limit];
+  const logs=db.prepare(`SELECT a.id,a.action,a.result,a.connection_id AS connectionId,COALESCE(c.name,a.connection_id,'—') AS connectionName,a.conversation_id AS conversationId,a.recording_id AS recordingId,a.created_at AS createdAt FROM audit_logs a LEFT JOIN connections c ON c.id=a.connection_id WHERE a.user_id=? AND a.action IN ('PLAYBACK','LIBRARY_PLAYBACK')${access} ORDER BY a.created_at DESC,a.id DESC LIMIT ?`).all(...values);
+  res.json({items:logs});
 });
 app.get('/api/recordings/:recordingId/download', requireAuth, requireRole('administrator','supervisor','quality_analyst'), async (req,res,next) => {
   let connection:Connection|undefined,conversationId='',recordingId='';
