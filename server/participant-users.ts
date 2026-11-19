@@ -10,7 +10,14 @@ export function participantUserLookupId(participant:any):string{
   const userId=typeof participant?.userId==='string'?participant.userId:'';
   if(userId)return userId;
   const participantName=typeof participant?.participantName==='string'?participant.participantName:'';
-  return UUID.test(participantName)?participantName:'';
+  if(UUID.test(participantName))return participantName;
+  for(const session of Array.isArray(participant?.sessions)?participant.sessions:[]){
+    if(typeof session?.userId==='string'&&session.userId)return session.userId;
+    for(const segment of Array.isArray(session?.segments)?session.segments:[]){
+      if(typeof segment?.userId==='string'&&segment.userId)return segment.userId;
+    }
+  }
+  return '';
 }
 
 export async function mapParticipantUserNames(client:ParticipantUserClient,conversation:any){
@@ -20,5 +27,5 @@ export async function mapParticipantUserNames(client:ParticipantUserClient,conve
   const names:Record<string,string>={};let cursor=0;
   async function worker(){while(true){const index=cursor++;if(index>=ids.length)return;const id=ids[index];try{const user=await client.get<any>(`/api/v2/users/${encodeURIComponent(id)}`);const name=typeof user?.name==='string'&&user.name.trim()?user.name.trim():[user?.firstName,user?.lastName].filter(value=>typeof value==='string'&&value.trim()).join(' ').trim();if(name)names[id]=name;}catch(error){if(!(error instanceof GenesysError&&[403,404].includes(error.status)))throw error;}}}
   await Promise.all(Array.from({length:Math.min(4,ids.length)},worker));
-  return {...conversation,participants:participants.map((participant:any)=>{const id=participantUserLookupId(participant);return id&&names[id]?{...participant,participantName:names[id]}:participant;})};
+  return {...conversation,participants:participants.map((participant:any)=>{const id=participantUserLookupId(participant);return id&&names[id]?{...participant,userId:participant.userId||id,participantName:names[id]}:participant;})};
 }

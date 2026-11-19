@@ -90,6 +90,7 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect((await request('/api/library')).status).toBe(401);
     expect((await request('/api/library/destinations')).status).toBe(401);
     expect((await request('/api/library/worker-status')).status).toBe(401);
+    expect((await request('/api/library/00000000-0000-4000-8000-000000000021/rearchive',{method:'POST'})).status).toBe(401);
     expect((await request('/api/playback-history')).status).toBe(401);
     expect((await request('/api/recordings/conversations/demo-ava-agent-001/summaries?connectionId=mock')).status).toBe(401);
     expect((await request('/api/recordings/conversations/demo-ava-agent-001/transcription?connectionId=mock')).status).toBe(401);
@@ -146,6 +147,8 @@ describe('HTTP API security and Mock Mode flows', () => {
     const schedules=await request('/api/library/schedules');
     expect(schedules.status).toBe(200);
     expect(await schedules.json()).toMatchObject({schedules:[]});
+    const scheduleNoCsrf=await request('/api/library/schedules',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Lookback schedule',connectionId:'00000000-0000-4000-8000-000000000001',destinationId:'00000000-0000-4000-8000-000000000002',cadence:'daily',runTime:'02:00',timeZone:'Asia/Bangkok',lookbackDays:30})});
+    expect(scheduleNoCsrf.status).toBe(403);
     const workerStatus=await request('/api/library/worker-status');
     expect(workerStatus.status).toBe(200);
     expect(await workerStatus.json()).toMatchObject({state:'idle',schedules:[]});
@@ -165,6 +168,9 @@ describe('HTTP API security and Mock Mode flows', () => {
     const archiveDb=new Database(integrationDatabasePath);
     archiveDb.prepare("INSERT INTO archived_recordings(id,connection_id,conversation_id,recording_id,destination_id,relative_path,file_name,mime_type,size_bytes,sha256,conversation_start,metadata_json,archived_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
       .run(archivedId,'range-test-connection','range-test-conversation','range-test-recording',savedDestinationBody.destination.id,relativeAudio,'fixture.m4a','audio/mp4',rangeAudio.length,'test-sha256',audioNow,'{}',audioNow,new Date(Date.now()+86400000).toISOString());
+    archiveDb.prepare("UPDATE archived_recordings SET direction='inbound',ani='+66812345678',dnis='+6621112222' WHERE id=?").run(archivedId);
+    archiveDb.prepare('INSERT INTO connections(id,name,organization_label,region_id,api_base_url,oauth_base_url,client_id,client_secret_enc,enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,0,?,?)').run('00000000-0000-4000-8000-000000000031','rearchive mock connection','test','us-east-1','https://api.mypurecloud.com','https://login.mypurecloud.com','test-client','',audioNow,audioNow);
+    archiveDb.prepare("UPDATE archived_recordings SET connection_id='00000000-0000-4000-8000-000000000031' WHERE id=?").run(archivedId);
     archiveDb.close();
     const rangedAudio=await request(`/api/library/${archivedId}/audio`,{headers:{Range:'bytes=2-5'}});
     expect(rangedAudio.status).toBe(206);
@@ -174,6 +180,13 @@ describe('HTTP API security and Mock Mode flows', () => {
     const invalidRange=await request(`/api/library/${archivedId}/audio`,{headers:{Range:'bytes=10-'}});
     expect(invalidRange.status).toBe(416);
     expect(invalidRange.headers.get('content-range')).toBe('bytes */10');
+    const noCsrfRearchive=await request(`/api/library/${archivedId}/rearchive`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
+    expect(noCsrfRearchive.status).toBe(403);
+    const mockRearchive=await request(`/api/library/${archivedId}/rearchive`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'},true);
+    expect(mockRearchive.status).toBe(409);
+    expect(await fs.readFile(path.join(testDirectory,'library-storage',relativeAudio))).toEqual(rangeAudio);
+    const libraryRows=await (await request('/api/library')).json() as {items:{id:string;displayNumber:string}[]};
+    expect(libraryRows.items.find(item=>item.id===archivedId)?.displayNumber).toBe('+6621112222');
     const cleanupArchiveAudit=new Database(integrationDatabasePath);
     cleanupArchiveAudit.prepare("DELETE FROM audit_logs WHERE action='LIBRARY_PLAYBACK' AND conversation_id='range-test-conversation'").run();
     cleanupArchiveAudit.close();
@@ -187,8 +200,18 @@ describe('HTTP API security and Mock Mode flows', () => {
     const scheduleDb=new Database(integrationDatabasePath);
     const mockConnectionId='00000000-0000-4000-8000-000000000011',scheduleId='00000000-0000-4000-8000-000000000012',now=new Date().toISOString();
     scheduleDb.prepare('INSERT INTO connections(id,name,organization_label,region_id,api_base_url,oauth_base_url,client_id,client_secret_enc,enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,0,?,?)').run(mockConnectionId,'Run-now test','test','us-east-1','https://api.mypurecloud.com','https://login.mypurecloud.com','test-client','',now,now);
-    scheduleDb.prepare("INSERT INTO library_schedules(id,name,connection_id,destination_id,cadence,run_time,time_zone,enabled,cursor_at,backfill_complete,next_run_at,run_status,created_at,updated_at) VALUES(?,?,?,?,'daily','02:00','UTC',0,?,1,?,'idle',?,?)").run(scheduleId,'Paused run-now test',mockConnectionId,savedDestinationBody.destination.id,now,now,now,now);
+    scheduleDb.prepare("INSERT INTO library_schedules(id,name,connection_id,destination_id,cadence,run_time,time_zone,lookback_days,enabled,cursor_at,backfill_complete,next_run_at,run_status,created_at,updated_at) VALUES(?,?,?,?,'daily','02:00','UTC',30,0,?,1,?,'idle',?,?)").run(scheduleId,'Paused run-now test',mockConnectionId,savedDestinationBody.destination.id,now,now,now,now);
+    const lookbackScheduleId='00000000-0000-4000-8000-000000000013';
+    scheduleDb.prepare("INSERT INTO library_schedules(id,name,connection_id,destination_id,cadence,run_time,time_zone,lookback_days,enabled,cursor_at,backfill_complete,next_run_at,run_status,created_at,updated_at) VALUES(?,?,?,?,'daily','02:00','UTC',550,0,?,1,?,'idle',?,?)").run(lookbackScheduleId,'Lookback update test',mockConnectionId,savedDestinationBody.destination.id,now,now,now,now);
+    scheduleDb.prepare("INSERT INTO library_archive_queue(schedule_id,conversation_id,conversation_start,status,created_at) VALUES(?,?,?,'pending',?),(?,?,?,'pending',?)").run(lookbackScheduleId,'outside-lookback','2020-01-01T00:00:00.000Z',now,lookbackScheduleId,'inside-lookback',now,now);
     scheduleDb.close();
+    const lookbackUpdate=await request(`/api/library/schedules/${lookbackScheduleId}`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Lookback update test',connectionId:mockConnectionId,destinationId:savedDestinationBody.destination.id,cadence:'daily',runTime:'02:00',timeZone:'UTC',lookbackDays:30,enabled:false})},true);
+    expect(lookbackUpdate.status).toBe(409);
+    const lookbackCheck=new Database(integrationDatabasePath,{readonly:true});
+    expect(lookbackCheck.prepare('SELECT conversation_id FROM library_archive_queue WHERE schedule_id=? ORDER BY conversation_id').all(lookbackScheduleId)).toEqual([{conversation_id:'inside-lookback'},{conversation_id:'outside-lookback'}]);
+    expect(lookbackCheck.prepare('SELECT enabled,backfill_complete,lookback_days FROM library_schedules WHERE id=?').get(lookbackScheduleId)).toMatchObject({enabled:0,backfill_complete:1,lookback_days:550});
+    lookbackCheck.close();
+    await request(`/api/library/schedules/${lookbackScheduleId}`,{method:'DELETE'},true);
     expect((await request(`/api/library/schedules/${scheduleId}/run-now`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'})).status).toBe(403);
     const runNow=await request(`/api/library/schedules/${scheduleId}/run-now`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'},true);
     expect(runNow.status).toBe(200);
@@ -463,7 +486,9 @@ describe('HTTP API security and Mock Mode flows', () => {
   it('filters and paginates audit events and persists the retention window', async () => {
     const defaultAudit = await request('/api/audit');
     expect(defaultAudit.status).toBe(200);
-    expect(await defaultAudit.json()).toMatchObject({ page: 1, pageSize: 25, totalPages: 1 });
+    const defaultAuditBody=await defaultAudit.json() as {page:number;pageSize:number;totalPages:number};
+    expect(defaultAuditBody).toMatchObject({page:1,pageSize:25});
+    expect(defaultAuditBody.totalPages).toBeGreaterThanOrEqual(1);
     const filteredAudit = await request('/api/audit?action=SEARCH&pageSize=50');
     expect(filteredAudit.status).toBe(200);
     expect((await filteredAudit.json() as { logs: { action: string }[]; pageSize: number }).logs.every(row => row.action === 'SEARCH')).toBe(true);

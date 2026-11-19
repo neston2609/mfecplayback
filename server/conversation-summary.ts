@@ -1,4 +1,5 @@
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const GENERIC_AGENT_NAMES = new Set(['agent', 'user', 'unknown', 'ivr flow', 'flow unavailable']);
 
 function readableName(value: unknown): string {
   if (typeof value !== 'string') return '';
@@ -46,18 +47,29 @@ function participantFlowName(participant: any): string {
   return '';
 }
 
+function participantUserId(participant: any): string {
+  if (typeof participant?.userId === 'string' && participant.userId) return participant.userId;
+  for (const session of Array.isArray(participant?.sessions) ? participant.sessions : []) {
+    if (typeof session?.userId === 'string' && session.userId) return session.userId;
+    for (const segment of Array.isArray(session?.segments) ? session.segments : []) {
+      if (typeof segment?.userId === 'string' && segment.userId) return segment.userId;
+    }
+  }
+  return '';
+}
+
 export function participantLines(participants: any[], userNames: Record<string, string> = {}): ParticipantLine[] {
   return participants.map(participant => {
     const purpose = typeof participant?.purpose === 'string' ? participant.purpose : '';
     const normalized = purpose.toLowerCase();
     const participantName = readableName(participant?.participantName);
-    const userId = typeof participant?.userId === 'string' ? participant.userId : '';
+    const userId = participantUserId(participant);
     let displayName = participantName || '—';
 
     if (normalized === 'customer') {
       displayName = `${participantPhone(participant, 'ani')} -> ${participantPhone(participant, 'dnis')}`;
     } else if (normalized === 'agent') {
-      displayName = readableName(userNames[userId]) || participantName || 'Agent';
+      displayName = readableName(userNames[userId]) || participantName || 'Name unavailable';
     } else if (normalized === 'user') {
       const participantId=typeof participant?.participantId==='string'?participant.participantId:'';
       displayName=readableName(userNames[participantId])||participantName||'User';
@@ -145,7 +157,7 @@ export function archivedConversationDisplay(conversation: any, recordingDuration
     : conversation || {};
   const safeNames = (value: unknown) => (Array.isArray(value) ? value : [])
     .map(readableName)
-    .filter(Boolean);
+    .filter(name => Boolean(name) && !GENERIC_AGENT_NAMES.has(name.toLowerCase()));
   let agents = safeNames(summary.agents);
   if (!agents.length && Array.isArray(summary.participants)) {
     agents = safeNames(summary.participants
@@ -170,6 +182,10 @@ export function archivedConversationDisplay(conversation: any, recordingDuration
     flows: flows.length ? [...new Set(flows)] : [],
     queues: [...new Set(safeNames(summary.queues))],
     interactionType: readableName(summary.interactionType) || 'Unknown',
+    direction: String(summary.direction || '').toLowerCase(),
+    callbackNumber: readablePhone(summary.callbackNumber),
+    ani: readablePhone(summary.ani),
+    dnis: readablePhone(summary.dnis),
     durationSeconds,
   };
 }
@@ -210,10 +226,13 @@ export function summarizeConversation(conversation: any, userNames: Record<strin
 
   for (const participant of participants) {
     const participantName = readableName(participant?.participantName);
-    const userId = typeof participant?.userId === 'string' ? participant.userId : '';
+    const userId = participantUserId(participant);
     const resolvedUserName = readableName(userNames[userId] || userNames[participant?.participantName]);
 
-    if (participant?.purpose === 'agent') agents.add(resolvedUserName || participantName || 'Agent');
+    if (participant?.purpose === 'agent') {
+      const agentName = resolvedUserName || participantName;
+      if (agentName && !GENERIC_AGENT_NAMES.has(agentName.toLowerCase())) agents.add(agentName);
+    }
     if (['ivr', 'flow', 'botflow'].includes(String(participant?.purpose || '').toLowerCase())) {
       const flowName = participantFlowName(participant)
         || participantName

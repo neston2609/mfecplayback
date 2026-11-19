@@ -40,6 +40,7 @@ describe('Sound Library schedule and storage security',()=>{
   it('starts historical archive within Genesys Analytics retention and reads local OS capacity',async()=>{
     const now=new Date('2026-11-19T18:42:00.000Z'),cursor=initialArchiveCursor(now),expected=new Date(Date.UTC(2026,10,19)-550*86400000).toISOString();
     expect(cursor).toBe(expected);
+    expect(initialArchiveCursor(now,30)).toBe(new Date(Date.UTC(2026,10,19)-30*86400000).toISOString());
     const capacity=await localFilesystemCapacity(root);
     expect(capacity?.totalBytes).toBeGreaterThan(0);
     expect(capacity?.freeBytes).toBeGreaterThan(0);

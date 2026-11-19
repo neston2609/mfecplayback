@@ -19,6 +19,7 @@ import { libraryTabFromPath, pathForLibraryTab } from '../../src/library-navigat
 import { mapParticipantUserNames, participantUserLookupId } from '../participant-users.js';
 import { byteRangeStream, parseByteRange } from '../audio-range.js';
 import { Readable } from 'node:stream';
+import { initialArchiveCursor } from '../library-schedule.js';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
@@ -33,6 +34,12 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(parseByteRange('bytes=10-', 10)).toBe('unsatisfiable');
     expect(parseByteRange('bytes=4-2', 10)).toBe('unsatisfiable');
     expect(parseByteRange('bytes=1-2,4-5', 10)).toBe('invalid');
+  });
+
+  it('limits first archive backfill cursor to the configured lookback days',()=>{
+    const now=new Date('2026-11-20T15:00:00.000Z');
+    expect(initialArchiveCursor(now,30)).toBe('2026-10-21T00:00:00.000Z');
+    expect(initialArchiveCursor(now,900)).toBe(initialArchiveCursor(now,550));
   });
 
   it('streams only the requested byte interval from destinations without native range reads', async () => {
@@ -128,9 +135,26 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(result).toMatchObject({agents:['Nicha Agent'],flows:[],ani:'',dnis:'+6621234567',direction:'outbound',interactionType:'Human Agent'});
   });
 
+  it('uses DNIS as the visible direction number for inbound calls',()=>{
+    const conversation={conversationId:'inbound-number',originatingDirection:'inbound',participants:[
+      {purpose:'customer',sessions:[{ani:'tel:+66812345678',dnis:'tel:+6621112222'}]},
+      {purpose:'agent',sessions:[{ani:'tel:+66999999999',dnis:'tel:+6621112222'}]},
+    ]};
+    const result=summarizeConversation(conversation);
+    expect(result).toMatchObject({direction:'inbound',ani:'+66812345678',dnis:'+6621112222'});
+    expect(archivedConversationDisplay({conversation:result})).toMatchObject({direction:'inbound',ani:'+66812345678'});
+  });
+
+  it('does not treat generic agent labels as real names and resolves the session user ID',()=>{
+    const conversation={conversationId:'session-agent',conversationStart:'2026-11-19T00:00:00.000Z',conversationEnd:'2026-11-19T00:01:00.000Z',participants:[{purpose:'agent',participantName:'Agent',sessions:[{userId:'session-user-id'}]}]};
+    expect(summarizeConversation(conversation).agents).toEqual([]);
+    expect(summarizeConversation(conversation,{'session-user-id':'Real Agent Name'}).agents).toEqual(['Real Agent Name']);
+    expect(participantUserLookupId(conversation.participants[0])).toBe('session-user-id');
+  });
+
   it('prepares archived conversation display values from resolved metadata without showing raw IDs',()=>{
     expect(archivedConversationDisplay({conversation:{agents:['Agent Name'],flows:['Flow Name'],queues:['Queue Name'],interactionType:'Bot to Agent',durationSeconds:null},participants:[{purpose:'agent',participantName:'10000000-0000-4000-8000-000000000001'}]},95000))
-      .toEqual({agents:['Agent Name'],flows:['Flow Name'],queues:['Queue Name'],interactionType:'Bot to Agent',durationSeconds:95});
+      .toEqual({agents:['Agent Name'],flows:['Flow Name'],queues:['Queue Name'],interactionType:'Bot to Agent',direction:'',callbackNumber:'',ani:'',dnis:'',durationSeconds:95});
   });
 
   it('provides the outbound callback number for display in the Direction column',()=>{
@@ -139,6 +163,9 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
       {purpose:'agent',sessions:[{callbackNumbers:['+66999999999']}]},
     ]});
     expect(result).toMatchObject({direction:'outbound',callbackNumber:'+66812345678',ani:''});
+    expect(archivedConversationDisplay({conversation:result})).toMatchObject({direction:'outbound',callbackNumber:'+66812345678'});
+    const inbound=summarizeConversation({conversationId:'inbound-callback',originatingDirection:'inbound',participants:[{purpose:'customer',sessions:[{ani:'tel:+66887654321',dnis:'tel:+6621112222'}]}]});
+    expect(archivedConversationDisplay({conversation:inbound}).ani).toBe('+66887654321');
   });
 
   it('includes transferred ACD queues and only readable wrap-up code names in the overview',()=>{
