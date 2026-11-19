@@ -5,7 +5,7 @@ import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
 import { queryAllConversations, VOICE_RECORDING_FILTERS } from '../conversation-query.js';
-import { collectQueueIds, conversationQueueNames, conversationWrapUpCodeNames, participantLines, summarizeConversation, withParticipantLines } from '../conversation-summary.js';
+import { archivedConversationDisplay, collectQueueIds, conversationQueueNames, conversationWrapUpCodeNames, participantLines, summarizeConversation, withParticipantLines } from '../conversation-summary.js';
 import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceInteraction, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaRequestPath, recordingMetadataRequestPath, recordingMediaUriForFormats, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
@@ -17,10 +17,31 @@ import { DEFAULT_RECORDING_OUTPUT_FORMAT, ffmpegArguments, parseRecordingOutputF
 import { execFileSync } from 'node:child_process';
 import { libraryTabFromPath, pathForLibraryTab } from '../../src/library-navigation.js';
 import { mapParticipantUserNames, participantUserLookupId } from '../participant-users.js';
+import { byteRangeStream, parseByteRange } from '../audio-range.js';
+import { Readable } from 'node:stream';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
   afterAll(() => { delete process.env.MASTER_ENCRYPTION_KEY; });
+
+  it('parses valid, suffix, clamped and unsatisfiable audio byte ranges', () => {
+    expect(parseByteRange(undefined, 10)).toBeUndefined();
+    expect(parseByteRange('bytes=2-5', 10)).toEqual({ start: 2, end: 5 });
+    expect(parseByteRange('bytes=7-', 10)).toEqual({ start: 7, end: 9 });
+    expect(parseByteRange('bytes=-4', 10)).toEqual({ start: 6, end: 9 });
+    expect(parseByteRange('bytes=8-99', 10)).toEqual({ start: 8, end: 9 });
+    expect(parseByteRange('bytes=10-', 10)).toBe('unsatisfiable');
+    expect(parseByteRange('bytes=4-2', 10)).toBe('unsatisfiable');
+    expect(parseByteRange('bytes=1-2,4-5', 10)).toBe('invalid');
+  });
+
+  it('streams only the requested byte interval from destinations without native range reads', async () => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of byteRangeStream(Readable.from([Buffer.from('abc'), Buffer.from('defg')]), { start: 2, end: 5 })) {
+      chunks.push(Buffer.from(chunk));
+    }
+    expect(Buffer.concat(chunks).toString()).toBe('cdef');
+  });
 
   it('maps Sound Library routes and tabs in both directions',()=>{
     expect(libraryTabFromPath('/library')).toBe('library');
@@ -105,6 +126,11 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     },{'eb13c121-2f73-4f10-b8da-3a550b0b4d29':'Nicha Agent'});
 
     expect(result).toMatchObject({agents:['Nicha Agent'],flows:[],ani:'',dnis:'+6621234567',direction:'outbound',interactionType:'Human Agent'});
+  });
+
+  it('prepares archived conversation display values from resolved metadata without showing raw IDs',()=>{
+    expect(archivedConversationDisplay({conversation:{agents:['Agent Name'],flows:['Flow Name'],queues:['Queue Name'],interactionType:'Bot to Agent',durationSeconds:null},participants:[{purpose:'agent',participantName:'10000000-0000-4000-8000-000000000001'}]},95000))
+      .toEqual({agents:['Agent Name'],flows:['Flow Name'],queues:['Queue Name'],interactionType:'Bot to Agent',durationSeconds:95});
   });
 
   it('provides the outbound callback number for display in the Direction column',()=>{
@@ -354,14 +380,18 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(recordingOutputInfo('m4a')).toEqual({extension:'m4a',mimeType:'audio/mp4'});
     expect(ffmpegArguments('mp4')).toContain('pipe:0');
     expect(ffmpegArguments('mp4')).toContain('-vn');
+    expect(ffmpegArguments('m4a')).toContain('-xerror');
     expect(ffmpegArguments('m4a')).toContain('aac');
     expect(ffmpegArguments('mp3')).toContain('libmp3lame');
     for(const format of RECORDING_OUTPUT_FORMATS)expect(ffmpegArguments(format)).toContain('-vn');
     const input=Buffer.from('synthetic audio bytes');let invoked=false;
-    const output=await transcodeRecordingAudio(input,'m4a',async(bytes,args)=>{invoked=true;expect(bytes).toEqual(input);expect(args).toContain('-vn');return Buffer.from('converted m4a');});
+    let runnerCalls=0;
+    const output=await transcodeRecordingAudio(input,'m4a',async(bytes,args)=>{runnerCalls++;invoked=true;expect(args).toContain('-vn');if(runnerCalls===1){expect(bytes).toEqual(input);return Buffer.from('converted m4a');}expect(bytes).toEqual(Buffer.from('converted m4a'));expect(args).toContain('-xerror');expect(args).toContain('-f');return Buffer.alloc(0);});
     expect(invoked).toBe(true);
     expect(output).toMatchObject({bytes:Buffer.from('converted m4a'),format:'m4a',extension:'m4a',mimeType:'audio/mp4'});
     await expect(transcodeRecordingAudio(input,'flac',async()=>Buffer.from('x'))).rejects.toThrow(/supported recording output format/i);
+    let invalidOutputCalls=0;
+    await expect(transcodeRecordingAudio(input,'mp3',async()=>++invalidOutputCalls===1?Buffer.from('not actually audio'):Promise.reject(new Error('decoder rejected output')))).rejects.toThrow(/integrity validation/i);
     await expect(transcodeRecordingAudio(input,'mp3',async()=>Buffer.alloc(0))).rejects.toThrow(/empty/i);
   });
 

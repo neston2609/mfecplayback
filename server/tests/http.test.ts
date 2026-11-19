@@ -136,7 +136,7 @@ describe('HTTP API security and Mock Mode flows', () => {
     if(recordingFormatInfo.conversionAvailable){expect(await updateFormat.json()).toMatchObject({format:'mp3',extension:'mp3',mimeType:'audio/mpeg'});expect(await (await request('/api/library/recording-format')).json()).toMatchObject({format:'mp3'});}
     if(ffmpegFixture&&recordingFormatInfo.conversionAvailable){
       const {transcodeRecordingAudio}=await import('../audio-transcode.js');
-      const converted=await transcodeRecordingAudio(await fs.readFile(ffmpegFixture),'mp3');
+      const converted=await transcodeRecordingAudio(await fs.readFile(ffmpegFixture),'mp3',async(input,args)=>execFileSync(process.env.FFMPEG_PATH!,args,{input,maxBuffer:16*1024*1024}));
       const output=path.join(testDirectory,`converted.${converted.extension}`);
       await fs.writeFile(output,converted.bytes);
       expect(()=>execFileSync(process.env.FFMPEG_PATH!,['-hide_banner','-loglevel','error','-i',output,'-f','null','-'],{stdio:'ignore'})).not.toThrow();
@@ -159,8 +159,26 @@ describe('HTTP API security and Mock Mode flows', () => {
     const savedDestinationBody=await savedDestination.json() as {destination:Record<string,unknown>};
     expect(savedDestinationBody.destination).toMatchObject({name:'Integration archive',type:'local',retentionDays:30});
     expect(savedDestinationBody.destination).not.toHaveProperty('password');
+    const archivedId='00000000-0000-4000-8000-000000000021',rangeAudio=Buffer.from('0123456789'),relativeAudio='range-test/fixture.m4a',audioNow=new Date().toISOString();
+    await fs.mkdir(path.join(testDirectory,'library-storage','range-test'),{recursive:true});
+    await fs.writeFile(path.join(testDirectory,'library-storage',relativeAudio),rangeAudio);
+    const archiveDb=new Database(integrationDatabasePath);
+    archiveDb.prepare("INSERT INTO archived_recordings(id,connection_id,conversation_id,recording_id,destination_id,relative_path,file_name,mime_type,size_bytes,sha256,conversation_start,metadata_json,archived_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(archivedId,'range-test-connection','range-test-conversation','range-test-recording',savedDestinationBody.destination.id,relativeAudio,'fixture.m4a','audio/mp4',rangeAudio.length,'test-sha256',audioNow,'{}',audioNow,new Date(Date.now()+86400000).toISOString());
+    archiveDb.close();
+    const rangedAudio=await request(`/api/library/${archivedId}/audio`,{headers:{Range:'bytes=2-5'}});
+    expect(rangedAudio.status).toBe(206);
+    expect(rangedAudio.headers.get('content-range')).toBe('bytes 2-5/10');
+    expect(rangedAudio.headers.get('accept-ranges')).toBe('bytes');
+    expect(Buffer.from(await rangedAudio.arrayBuffer())).toEqual(Buffer.from('2345'));
+    const invalidRange=await request(`/api/library/${archivedId}/audio`,{headers:{Range:'bytes=10-'}});
+    expect(invalidRange.status).toBe(416);
+    expect(invalidRange.headers.get('content-range')).toBe('bytes */10');
+    const cleanupArchiveAudit=new Database(integrationDatabasePath);
+    cleanupArchiveAudit.prepare("DELETE FROM audit_logs WHERE action='LIBRARY_PLAYBACK' AND conversation_id='range-test-conversation'").run();
+    cleanupArchiveAudit.close();
     const destinationList=await (await request('/api/library/destinations')).json() as {destinations:{id:string;storageTotalBytes:number;storageFreeBytes:number;archivedBytes:number}[]};
-    expect(destinationList.destinations[0]).toMatchObject({id:savedDestinationBody.destination.id,archivedBytes:0});
+    expect(destinationList.destinations[0]).toMatchObject({id:savedDestinationBody.destination.id,archivedBytes:rangeAudio.length});
     expect(destinationList.destinations[0].storageTotalBytes).toBeGreaterThan(0);
     expect(destinationList.destinations[0].storageFreeBytes).toBeGreaterThan(0);
     const mockSchedule=await request('/api/library/schedules',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Backfill',connectionId:'00000000-0000-4000-8000-000000000001',destinationId:'00000000-0000-4000-8000-000000000002',cadence:'daily',runTime:'02:00',timeZone:'Asia/Bangkok'})},true);
@@ -175,6 +193,14 @@ describe('HTTP API security and Mock Mode flows', () => {
     const runNow=await request(`/api/library/schedules/${scheduleId}/run-now`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'},true);
     expect(runNow.status).toBe(200);
     expect(await runNow.json()).toMatchObject({ok:true,queued:true});
+    const workerDeadline=Date.now()+5000;
+    while(Date.now()<workerDeadline){
+      const pollDb=new Database(integrationDatabasePath,{readonly:true});
+      const state=pollDb.prepare('SELECT run_requested,run_status FROM library_schedules WHERE id=?').get(scheduleId) as {run_requested:number;run_status:string};
+      pollDb.close();
+      if(state.run_requested===0&&state.run_status==='failed')break;
+      await new Promise(resolve=>setTimeout(resolve,50));
+    }
     const verifyDb=new Database(integrationDatabasePath,{readonly:true});
     expect(verifyDb.prepare('SELECT enabled,run_requested,run_status,last_started_at,last_error FROM library_schedules WHERE id=?').get(scheduleId)).toMatchObject({enabled:0,run_requested:0,run_status:'failed'});
     const runResult=verifyDb.prepare('SELECT last_started_at,last_error FROM library_schedules WHERE id=?').get(scheduleId) as {last_started_at:string;last_error:string};

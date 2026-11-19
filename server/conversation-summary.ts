@@ -139,6 +139,41 @@ export function conversationWrapUpCodeNames(conversation: any): string[] {
   return [...names];
 }
 
+export function archivedConversationDisplay(conversation: any, recordingDurationMs?: number | null) {
+  const summary = conversation?.conversation && typeof conversation.conversation === 'object'
+    ? conversation.conversation
+    : conversation || {};
+  const safeNames = (value: unknown) => (Array.isArray(value) ? value : [])
+    .map(readableName)
+    .filter(Boolean);
+  let agents = safeNames(summary.agents);
+  if (!agents.length && Array.isArray(summary.participants)) {
+    agents = safeNames(summary.participants
+      .filter((participant: any) => String(participant?.purpose || '').toLowerCase() === 'agent')
+      .map((participant: any) => participant?.displayName || participant?.participantName));
+  }
+  let flows = safeNames(summary.flows);
+  if (!flows.length && Array.isArray(summary.participants)) {
+    flows = safeNames(summary.participants
+      .filter((participant: any) => ['ivr', 'flow', 'botflow'].includes(String(participant?.purpose || '').toLowerCase()))
+      .map((participant: any) => participant?.displayName || participant?.participantName));
+  }
+  const summaryDuration = summary.durationSeconds;
+  const recordingDuration = recordingDurationMs;
+  const durationSeconds = summaryDuration !== null && summaryDuration !== undefined && Number.isFinite(Number(summaryDuration)) && Number(summaryDuration) >= 0
+    ? Math.round(Number(summaryDuration))
+    : recordingDuration !== null && recordingDuration !== undefined && Number.isFinite(Number(recordingDuration)) && Number(recordingDuration) >= 0
+      ? Math.round(Number(recordingDuration) / 1000)
+      : null;
+  return {
+    agents: agents.length ? [...new Set(agents)] : [],
+    flows: flows.length ? [...new Set(flows)] : [],
+    queues: [...new Set(safeNames(summary.queues))],
+    interactionType: readableName(summary.interactionType) || 'Unknown',
+    durationSeconds,
+  };
+}
+
 function firstPhone(participants: any[], field: 'ani' | 'dnis'): string {
   const ordered = [...participants].sort((a, b) => Number(b?.purpose === 'customer') - Number(a?.purpose === 'customer'));
   for (const participant of ordered) {
@@ -171,6 +206,7 @@ export function summarizeConversation(conversation: any, userNames: Record<strin
   const queues = new Set(conversationQueueNames(conversation));
   const wrapUpNames = conversationWrapUpCodeNames(conversation);
   const wrapUp = wrapUpNames[wrapUpNames.length - 1] || '';
+  const readableQueues = [...queues].filter(name => readableName(name));
 
   for (const participant of participants) {
     const participantName = readableName(participant?.participantName);
@@ -186,9 +222,6 @@ export function summarizeConversation(conversation: any, userNames: Record<strin
       flows.add(flowName);
     }
 
-    for (const session of participant?.sessions || []) {
-      if (session?.queueName) queues.add(session.queueName);
-    }
   }
 
   const hasBot = flows.size > 0;
@@ -203,7 +236,7 @@ export function summarizeConversation(conversation: any, userNames: Record<strin
     agents: [...agents],
     flows: [...flows],
     participants: participantLines(participants, userNames),
-    queues: [...queues],
+    queues: readableQueues,
     wrapUp,
     durationSeconds: conversation.conversationStart && conversation.conversationEnd
       ? Math.round((Date.parse(conversation.conversationEnd) - Date.parse(conversation.conversationStart)) / 1000)

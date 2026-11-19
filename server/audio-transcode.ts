@@ -46,7 +46,7 @@ export function genesysMediaFormatKey(format: string): string {
 }
 
 export function ffmpegArguments(format: RecordingOutputFormat): string[] {
-  const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-protocol_whitelist', 'pipe', '-i', 'pipe:0', '-map', '0:a:0', '-vn', '-sn', '-dn'];
+  const args = ['-hide_banner', '-loglevel', 'error', '-xerror', '-nostdin', '-protocol_whitelist', 'pipe', '-i', 'pipe:0', '-map', '0:a:0', '-vn', '-sn', '-dn'];
   switch (format) {
     case 'm4a': return [...args, '-c:a', 'aac', '-b:a', '128k', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'];
     case 'mp4': return [...args, '-c:a', 'aac', '-b:a', '128k', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'];
@@ -59,6 +59,10 @@ export function ffmpegArguments(format: RecordingOutputFormat): string[] {
   }
 }
 
+function ffmpegValidationArguments(): string[] {
+  return ['-hide_banner', '-loglevel', 'error', '-xerror', '-nostdin', '-protocol_whitelist', 'pipe', '-i', 'pipe:0', '-map', '0:a:0', '-vn', '-sn', '-dn', '-f', 'null', '-'];
+}
+
 type FfmpegRunner = (input: Buffer, args: string[]) => Promise<Buffer>;
 
 export async function transcodeRecordingAudio(input: Buffer, requestedFormat: unknown, runner: FfmpegRunner = runFfmpeg): Promise<{ bytes: Buffer; format: RecordingOutputFormat; extension: string; mimeType: string }> {
@@ -68,6 +72,11 @@ export async function transcodeRecordingAudio(input: Buffer, requestedFormat: un
   try {
     const bytes = await runner(input, ffmpegArguments(format));
     if (!bytes.length || bytes.length > MAX_TRANSCODED_AUDIO_BYTES) throw new Error('Converted recording is empty or exceeds the 256 MB output limit.');
+    try {
+      await runner(bytes, ffmpegValidationArguments());
+    } catch {
+      throw new Error('Converted recording failed audio integrity validation and will not be archived.');
+    }
     return { bytes, format, ...recordingOutputInfo(format) };
   } finally {
     activeTranscodes--;

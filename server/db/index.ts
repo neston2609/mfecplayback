@@ -31,6 +31,9 @@ export function migrate() {
   const libraryScheduleColumns=new Set((db.prepare('PRAGMA table_info(library_schedules)').all() as {name:string}[]).map(column=>column.name));
   if(!libraryScheduleColumns.has('run_time'))db.exec("ALTER TABLE library_schedules ADD COLUMN run_time TEXT NOT NULL DEFAULT '02:00'");
   if(!libraryScheduleColumns.has('run_requested'))db.exec('ALTER TABLE library_schedules ADD COLUMN run_requested INTEGER NOT NULL DEFAULT 0');
+  const archivedRecordingColumns=new Set((db.prepare('PRAGMA table_info(archived_recordings)').all() as {name:string}[]).map(column=>column.name));
+  if(!archivedRecordingColumns.has('flows'))db.exec("ALTER TABLE archived_recordings ADD COLUMN flows TEXT NOT NULL DEFAULT '[]'");
+  if(!archivedRecordingColumns.has('interaction_type'))db.exec("ALTER TABLE archived_recordings ADD COLUMN interaction_type TEXT NOT NULL DEFAULT 'Unknown'");
   db.prepare(`UPDATE connections
     SET api_base_url='https://api.apse1.pure.cloud', oauth_base_url='https://login.apse1.pure.cloud',
         last_success_at=NULL, last_error=NULL, updated_at=?

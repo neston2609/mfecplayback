@@ -9,6 +9,8 @@ import { z } from 'zod';
 import { decrypt, encrypt } from './security.js';
 import { Readable } from 'node:stream';
 import crypto from 'node:crypto';
+import type { ByteRange } from './audio-range.js';
+import { byteRangeStream } from './audio-range.js';
 
 export const DEFAULT_LIBRARY_PATH = process.env.LIBRARY_STORAGE_ROOT || '/var/lib/mfec-recording-explorer/library';
 export function assertLocalDestinationPath(destinationPath:string,rootPath=process.env.LIBRARY_STORAGE_ROOT||'/var/lib/mfec-recording-explorer/library'){const root=path.resolve(rootPath),configured=path.resolve(destinationPath||root);if(configured!==root&&!configured.startsWith(`${root}${path.sep}`))throw new Error(`Local destinations must stay under the configured library root (${root}).`);return configured;}
@@ -129,15 +131,15 @@ export async function readDestinationFileBuffer(config:DestinationConfig, relati
   return Buffer.concat(chunks,total);
 }
 
-export async function readDestinationFile(config:DestinationConfig, relativeName:string) {
-  if(config.type==='local'){const target=localPath(config,relativeName).target;await assertLocalFilesystemPath(path.dirname(target));const stream=createReadStream(target);stream.once('open',()=>void assertLocalFilesystemPath(path.dirname(target)).catch(error=>stream.destroy(error as Error)));return stream;}
+export async function readDestinationFile(config:DestinationConfig, relativeName:string, range?:ByteRange) {
+  if(config.type==='local'){const target=localPath(config,relativeName).target;await assertLocalFilesystemPath(path.dirname(target));const stream=createReadStream(target,range);stream.once('open',()=>void assertLocalFilesystemPath(path.dirname(target)).catch(error=>stream.destroy(error as Error)));return stream;}
   if(config.type==='sftp'){
-    const {ssh,sftp}=await sshConnect(config);const stream=sftp.createReadStream(path.posix.join('/',...safeParts(config.path),...safeParts(relativeName)));stream.once('close',()=>ssh.end());stream.once('error',()=>ssh.end());return stream;
+    const {ssh,sftp}=await sshConnect(config);const stream=sftp.createReadStream(path.posix.join('/',...safeParts(config.path),...safeParts(relativeName)),range?{start:range.start,end:range.end}:undefined);stream.once('close',()=>ssh.end());stream.once('error',()=>ssh.end());return stream;
   }
   if(config.type==='smb'){
-    const smb=smbClient(config);await smb.connect();const stream=smb.createReadStream(smbRelative(config,relativeName));const close=()=>{void smb.close().catch(()=>{});};stream.once('close',close);stream.once('error',close);return stream;
+    const smb=smbClient(config);await smb.connect();const stream=smb.createReadStream(smbRelative(config,relativeName));const close=()=>{void smb.close().catch(()=>{});};stream.once('close',close);stream.once('error',close);return range?byteRangeStream(stream,range):stream;
   }
-  const temp=path.join(process.env.TMPDIR||process.env.TEMP||'/tmp',`mfec-library-${crypto.randomUUID()}`);const ftp=new FtpClient(30000,{allowSeparateTransferHost:false});try{await ftp.access({host:config.host,port:config.port,user:config.username,password:config.password,secure:true});await ftp.downloadTo(temp,path.posix.join('/',...safeParts(config.path),...safeParts(relativeName)));}finally{ftp.close();}const stream=createReadStream(temp);stream.once('close',()=>void fs.unlink(temp).catch(()=>{}));return stream;
+  const temp=path.join(process.env.TMPDIR||process.env.TEMP||'/tmp',`mfec-library-${crypto.randomUUID()}`);const ftp=new FtpClient(30000,{allowSeparateTransferHost:false});try{await ftp.access({host:config.host,port:config.port,user:config.username,password:config.password,secure:true});await ftp.downloadTo(temp,path.posix.join('/',...safeParts(config.path),...safeParts(relativeName)));}finally{ftp.close();}const stream=createReadStream(temp,range);stream.once('close',()=>void fs.unlink(temp).catch(()=>{}));return stream;
 }
 
 export async function deleteDestinationFile(config:DestinationConfig, relativeName:string) {
