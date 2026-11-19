@@ -80,6 +80,8 @@ npm run db:migrate   # Apply idempotent SQLite schema
 | POST | `/api/recordings/search` | Bounded details query + recording discovery |
 | GET | `/api/recordings/conversations/:id` | Conversation detail |
 | GET | `/api/recordings/conversations/:id/recordings` | Recording discovery |
+| GET | `/api/recordings/conversations/:id/summaries` | AVA/Auto Wrap-up and AI Summary/Agent Copilot from separate Genesys APIs |
+| GET | `/api/recordings/conversations/:id/transcription` | Transcript search and bounded server-side transcript retrieval |
 | GET | `/api/recordings/:id/metadata` | Recording metadata |
 | GET | `/api/recordings/:id/stream` | Authenticated media proxy (Range/no-store) |
 | GET | `/api/recordings/:id/download` | Role-restricted audited download |
@@ -186,7 +188,7 @@ Stop the service or use SQLite's online backup mechanism to produce a consistent
 - Participant purpose and returned flow fields are used as classification signals. Names alone are not sufficient for bot classification; admin-managed flow mapping is schema-ready but not yet surfaced.
 - The browser audio player uses an authenticated backend stream proxy and HTTP Range forwarding. Media URL structure/host allowlists and redirects are validated, and no redirects are followed to untrusted hosts. Actual Genesys recording response/media URI variants still require validation against an authorized non-production organization. Signed media URLs are not persisted/logged.
 - ANI/DNIS remain post-filtered on a fetched API page; this can miss matching conversations outside that page. A conversation-ID lookup now checks the selected supported filters but does not use Analytics paging.
-- Dashboard metrics and Speech and Text Analytics transcripts are available in bounded form. Dashboard queries are limited to 30 days, split into seven-day requests, capped at 1,000 conversations, and explicitly labeled partial when limits or recording permissions prevent complete totals. Transcript URLs are retrieved and validated server-side; neither OAuth credentials nor signed transcript URLs are sent to the browser.
+- Dashboard metrics and Speech and Text Analytics transcripts are available in bounded form. Dashboard queries are limited to 30 days, split into seven-day requests, capped at 1,000 conversations, and explicitly labeled partial when limits or recording permissions prevent complete totals. Transcript search identifies matching communication IDs before transcript URLs are retrieved and validated server-side; neither OAuth credentials nor signed transcript URLs are sent to the browser. Conversation Downloads keep AVA summaries/Auto Wrap-up, AI Summary/Agent Copilot, and Actual Analytics wrap-up codes separate; only transcripts and conversation summaries are downloadable.
 - Customer enrichment/indexing, filter capability registry and nested AND/OR groups, server-persisted saved searches, reference-data pickers, division-aware app grants, asynchronous details jobs, playback-history UI, audit retention/archival jobs, and multi-instance/PostgreSQL support are not delivered. Advanced UI-only fields are informational/disabled in function, not server-side search criteria; do not rely on them.
 - No live Genesys organization was available here; live OAuth, search, recording, transcription, CORS/media, permissions and formats are unverified.
 

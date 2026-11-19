@@ -82,6 +82,8 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(anonymous.status).toBe(401);
     expect((await request('/api/library')).status).toBe(401);
     expect((await request('/api/library/destinations')).status).toBe(401);
+    expect((await request('/api/recordings/conversations/demo-ava-agent-001/summaries?connectionId=mock')).status).toBe(401);
+    expect((await request('/api/recordings/conversations/demo-ava-agent-001/transcription?connectionId=mock')).status).toBe(401);
     const badLogin = await request('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'integration-admin', password: 'wrong password' }) });
     expect(badLogin.status).toBe(401);
     const login = await request('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'integration-admin', password: 'Integration-Test-Password-456!' }) });
@@ -146,6 +148,13 @@ describe('HTTP API security and Mock Mode flows', () => {
     const conversationRecordings=await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock');
     expect(conversationRecordings.status).toBe(200);
     expect(await conversationRecordings.json()).toMatchObject([{id:'demo-recording-1',mediaType:'voice'}]);
+    const mockConversationDetails=await request('/api/recordings/conversations/demo-ava-agent-001?connectionId=mock');
+    expect(mockConversationDetails.status).toBe(200);
+    expect(await mockConversationDetails.json()).toMatchObject({conversationId:'demo-ava-agent-001',wrapUpNotes:[{agent:'Nicha S.',note:'Customer confirmed the issue was resolved after the account settings were updated.'}]});
+    const mockSummaries=await request('/api/recordings/conversations/demo-ava-agent-001/summaries?connectionId=mock');
+    expect(mockSummaries.status).toBe(501);
+    const mockTranscription=await request('/api/recordings/conversations/demo-ava-agent-001/transcription?connectionId=mock');
+    expect(mockTranscription.status).toBe(501);
     const messageRecordings=await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock');
     expect((await messageRecordings.json() as {mediaType:string}[]).every(recording=>recording.mediaType==='voice')).toBe(true);
     const messageMetadata=await request('/api/recordings/demo-message-1/metadata?connectionId=mock&conversationId=demo-ava-agent-001');

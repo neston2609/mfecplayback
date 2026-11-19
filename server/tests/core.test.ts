@@ -10,6 +10,7 @@ import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isV
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from '../wrapup.js';
+import { aiConversationSummaryPath, analyticsConversationDetailsPath, avaConversationSummaryPath, fetchConversationSummaryArtifacts, transcriptSearchCommunicationIds, transcriptSearchPath, transcriptSearchRequest } from '../conversation-artifacts.js';
 import { checkPasswordPolicy, isPasswordPolicySatisfied } from '../password-policy.js';
 import { parseSmtpSettings, publicSmtpSettings } from '../mailer.js';
 
@@ -378,6 +379,37 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(validateTranscriptUrl(good).hostname).toBe('genesys-transcripts.s3.amazonaws.com');
     expect(()=>validateTranscriptUrl('https://attacker.example/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600')).toThrow(/untrusted/i);
     expect(()=>validateTranscriptUrl('http://genesys-transcripts.s3.amazonaws.com/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600')).toThrow(/untrusted/i);
+  });
+
+  it('builds the explicit Genesys summary, details, and transcript search API requests', () => {
+    expect(analyticsConversationDetailsPath('conversation/id')).toBe('/api/v2/analytics/conversations/conversation%2Fid/details');
+    expect(avaConversationSummaryPath('conversation/id')).toBe('/api/v2/conversations/conversation%2Fid/summaries');
+    expect(aiConversationSummaryPath('conversation/id')).toBe('/api/v2/speechandtextanalytics/conversations/conversation%2Fid/summaries');
+    expect(transcriptSearchPath()).toBe('/api/v2/speechandtextanalytics/transcripts/search');
+    expect(transcriptSearchRequest('conversation-1')).toEqual({pageSize:100,pageNumber:1,types:['transcripts'],returnFields:['conversationId','communicationId'],query:[{type:'EXACT',fields:['conversationId'],value:'conversation-1'}]});
+  });
+
+  it('extracts only matching, bounded communication IDs from transcript search results', () => {
+    expect(transcriptSearchCommunicationIds({results:[
+      {conversationId:'conversation-1',communicationId:'voice-1'},
+      {conversationId:'conversation-2',communicationId:'other-conversation'},
+      {conversationId:'conversation-1',communicationId:'voice-1'},
+      {conversationId:'conversation-1',communicationId:'x'.repeat(129)},
+    ]},'conversation-1')).toEqual(['voice-1']);
+    expect(transcriptSearchCommunicationIds({results:[{communicationId:'only-result'}]},'conversation-1')).toEqual(['only-result']);
+    expect(transcriptSearchCommunicationIds({results:[{conversationId:'another-conversation',communicationId:'wrong'},{conversationId:'conversation-1',communicationId:'right'}]},'conversation-1')).toEqual(['right']);
+    expect(transcriptSearchCommunicationIds({results:[{conversationId:'another-conversation',communicationId:'wrong'}]},'conversation-1')).toEqual([]);
+  });
+
+  it('loads AVA and AI summaries independently and tolerates unavailable summary endpoints', async () => {
+    const calls:string[]=[];
+    const client={get:async(path:string)=>{calls.push(path);if(path.includes('/speechandtextanalytics/'))return {entities:[{summary:'AI summary'}]};return {summary:'AVA summary',wrapUpCodes:['Auto wrap-up']};},post:async()=>undefined};
+    await expect(fetchConversationSummaryArtifacts(client,'conversation-1')).resolves.toEqual({avaSummary:{summary:'AVA summary',wrapUpCodes:['Auto wrap-up']},aiSummary:{entities:[{summary:'AI summary'}]}});
+    expect(calls).toEqual(['/api/v2/conversations/conversation-1/summaries','/api/v2/speechandtextanalytics/conversations/conversation-1/summaries']);
+    const partialClient={get:async(path:string)=>{if(path.includes('/speechandtextanalytics/'))throw Object.assign(new Error('not found'),{status:404});return {summary:'AVA only'};},post:async()=>undefined};
+    await expect(fetchConversationSummaryArtifacts(partialClient,'conversation-2')).resolves.toEqual({avaSummary:{summary:'AVA only'},aiSummary:null});
+    const forbiddenClient={get:async()=>{throw Object.assign(new Error('forbidden'),{status:403});},post:async()=>undefined};
+    await expect(fetchConversationSummaryArtifacts(forbiddenClient,'conversation-3')).rejects.toMatchObject({status:403});
   });
 
   it('extracts the true after-call summary note and maps wrap-up UUIDs to names', () => {

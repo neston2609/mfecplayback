@@ -9,6 +9,7 @@ import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { extractSingleAudioFromZip } from './zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from './transcription.js';
+import { analyticsConversationDetailsPath, fetchConversationSummaryArtifacts, transcriptSearchCommunicationIds, transcriptSearchPath, transcriptSearchRequest } from './conversation-artifacts.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from './wrapup.js';
 import { db, migrate } from './db/index.js';
 import { clearUserAppearance, getDefaultAppearance, getUserAppearance, parseAppearance, saveDefaultAppearance, saveUserAppearance } from './appearance.js';
@@ -506,7 +507,7 @@ app.post('/api/recordings/search', requireAuth, requireCsrf, rateLimit({windowMs
   } catch(error) { audit(req,'SEARCH','FAILED'); next(error); }
 });
 app.get('/api/recordings/conversations/:conversationId', requireAuth, async (req,res,next) => {
-  try { const conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.');if(String(req.query.connectionId||'')==='mock'&&process.env.MOCK_MODE==='true'){const mock=MOCK_CONVERSATIONS.find(item=>item.conversationId===conversationId);return mock?res.json({...withParticipantLines(mock),wrapUpNotes:collectAfterCallNotes(mock)}):res.status(404).json({error:'Conversation not found.'});}const connection = connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role); const client = new GenesysClient(connection); const conversation = await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`); const mapped=await mapWrapUpNames(client,conversation);const named=await mapParticipantUserNames(client,mapped);const display=withParticipantLines(named); audit(req,'DETAILS_VIEW','SUCCESS',connection.id,conversationId); res.json({...redactSensitiveMetadata(display),wrapUpNotes:collectAfterCallNotes(mapped)}); }
+   try { const conversationId=String(req.params.conversationId);if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.');if(String(req.query.connectionId||'')==='mock'&&process.env.MOCK_MODE==='true'){const mock=MOCK_CONVERSATIONS.find(item=>item.conversationId===conversationId);return mock?res.json({...withParticipantLines(mock),wrapUpNotes:collectAfterCallNotes(mock)}):res.status(404).json({error:'Conversation not found.'});}const connection = connectionById(String(req.query.connectionId||''),req.session.user!.id,req.session.user!.role); const client = new GenesysClient(connection); const conversation = await client.get<any>(analyticsConversationDetailsPath(conversationId)); const mapped=await mapWrapUpNames(client,conversation);const named=await mapParticipantUserNames(client,mapped);const display=withParticipantLines(named); audit(req,'DETAILS_VIEW','SUCCESS',connection.id,conversationId); res.json({...redactSensitiveMetadata(display),wrapUpNotes:collectAfterCallNotes(mapped)}); }
   catch(error) { next(error); }
 });
   app.get('/api/recordings/conversations/:conversationId/recordings', requireAuth, async (req,res,next) => {
@@ -516,6 +517,18 @@ app.get('/api/recordings/conversations/:conversationId', requireAuth, async (req
 app.get('/api/recordings/:recordingId/metadata', requireAuth, async (req,res,next) => {
       try { const cId=String(req.query.connectionId||''), conversationId=String(req.query.conversationId||''),recordingId=String(req.params.recordingId);if(!conversationId||conversationId.length>128||!recordingId||recordingId.length>128)throw httpError(400,'Valid conversation and recording IDs are required.'); if(cId==='mock'&&process.env.MOCK_MODE==='true') { const conversation=MOCK_CONVERSATIONS.find(item=>item.conversationId===conversationId),r=((MOCK_RECORDINGS[conversationId] as any[])||[]).find(recording=>recording.id===recordingId&&isVoiceRecording(recording,conversation)); return r?res.json(safeRecording(r,conversation)):res.status(404).json({error:'Voice recording not found.'}); } const c=connectionById(cId,req.session.user!.id,req.session.user!.role),client=new GenesysClient(c),conversation=await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`);const items=await listVoiceRecordings(client,conversationId,conversation);if(!items.some(item=>String(item.id||item.recordingId)===recordingId))throw httpError(404,'Voice recording not found.');const item=await client.get<any>(recordingMediaRequestPath(conversationId,recordingId));if(!item)throw httpError(409,'Genesys did not return recording metadata.');if(!isVoiceRecording(item,conversation)&&!items.some(metadata=>String(metadata.id||metadata.recordingId)===recordingId&&isVoiceRecording(metadata,conversation)))throw httpError(404,'Voice recording not found.');audit(req,'RECORDING_METADATA_VIEW','SUCCESS',c.id,conversationId,recordingId); res.json(safeRecording({...items.find(metadata=>String(metadata.id||metadata.recordingId)===recordingId),...item},conversation)); }
   catch(error) { next(error); }
+ });
+app.get('/api/recordings/conversations/:conversationId/summaries', requireAuth, requireRole('administrator','supervisor','quality_analyst'), async (req,res,next) => {
+  try {
+    const conversationId=String(req.params.conversationId||''),connectionId=String(req.query.connectionId||'');
+    if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.');
+    if(connectionId==='mock'&&process.env.MOCK_MODE==='true')throw httpError(501,'Synthetic Mock Mode does not include live Genesys summaries.');
+    const connection=connectionById(connectionId,req.session.user!.id,req.session.user!.role),client=new GenesysClient(connection);
+    const summaries=await fetchConversationSummaryArtifacts(client,conversationId);
+    audit(req,'CONVERSATION_SUMMARY_VIEW','SUCCESS',connection.id,conversationId);
+    res.setHeader('Cache-Control','private, no-store, no-cache, must-revalidate');
+    res.json({conversationId,avaSummary:redactSensitiveMetadata(summaries.avaSummary),aiSummary:redactSensitiveMetadata(summaries.aiSummary)});
+  } catch(error) { next(error); }
 });
 app.get('/api/recordings/conversations/:conversationId/transcription', requireAuth, requireRole('administrator','supervisor','quality_analyst'), async (req,res,next) => {
   try {
@@ -523,8 +536,17 @@ app.get('/api/recordings/conversations/:conversationId/transcription', requireAu
     if(!conversationId||conversationId.length>128)throw httpError(400,'A valid conversation ID is required.');
     if(connectionId==='mock'&&process.env.MOCK_MODE==='true')throw httpError(501,'Synthetic Mock Mode does not include transcription data.');
     const connection=connectionById(connectionId,req.session.user!.id,req.session.user!.role),client=new GenesysClient(connection);
-    const conversation=await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`);
-    const communicationIds=conversationCommunicationIds(conversation);
+    const conversation=await client.get<any>(analyticsConversationDetailsPath(conversationId));
+    const detailCommunicationIds=conversationCommunicationIds(conversation);
+    let communicationIds:string[];
+    try {
+      const matches=await client.post<unknown>(transcriptSearchPath(),transcriptSearchRequest(conversationId));
+      const searchedCommunicationIds=transcriptSearchCommunicationIds(matches,conversationId);
+      communicationIds=searchedCommunicationIds.length?searchedCommunicationIds:detailCommunicationIds;
+    } catch(error) {
+      if(error instanceof GenesysError&&[400,403,404,405,501].includes(error.status))communicationIds=detailCommunicationIds;
+      else throw error;
+    }
     if(!communicationIds.length)throw httpError(404,'No voice communication was found for this conversation.');
     const transcripts=await mapWithConcurrency(communicationIds,4,async communicationId=>{
       try {
