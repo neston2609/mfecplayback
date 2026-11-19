@@ -9,7 +9,7 @@ import { decryptDestination, deleteDestinationFile, readDestinationFile, readDes
 import { getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, validateRecordingMediaUrl } from './recording-media.js';
 import { summarizeConversation } from './conversation-summary.js';
 import { extractSingleAudioFromZip } from './zip-audio.js';
-import { nextScheduleTime } from './library-schedule.js';
+import { initialArchiveCursor, nextScheduleTime } from './library-schedule.js';
 import { VOICE_RECORDING_FILTERS } from './conversation-query.js';
 import { DEFAULT_RECORDING_OUTPUT_FORMAT, genesysMediaFormatKey, parseRecordingOutputFormat, preferredGenesysInputFormat, transcodeRecordingAudio, type RecordingOutputFormat } from './audio-transcode.js';
 
@@ -61,7 +61,7 @@ export class LibraryArchiveWorker {
   constructor(private readonly deps:ArchiveDeps={}){}
   start(){if(this.timer)return;this.timer=setInterval(()=>void this.tick(),30000);this.timer.unref();void this.tick();}
   stop(){if(this.timer)clearInterval(this.timer);this.timer=undefined;}
-  async tick(){if(this.running)return;this.running=true;try{this.purgeExpired().catch(()=>{});const schedules=db.prepare("SELECT * FROM library_schedules WHERE enabled=1 ORDER BY created_at").all() as Schedule[];for(const schedule of schedules){try{await this.runSchedule(schedule);}catch(error){const limited=error instanceof GenesysError&&error.status===429;db.prepare("UPDATE library_schedules SET run_status=?,last_error=?,updated_at=? WHERE id=?").run(limited?'queued':'failed',safeError(error),this.now().toISOString(),schedule.id);if(limited)break;}}}finally{this.running=false;}}
+  async tick(){if(this.running)return;this.running=true;try{this.purgeExpired().catch(()=>{});const schedules=db.prepare("SELECT * FROM library_schedules WHERE enabled=1 OR run_requested=1 ORDER BY created_at").all() as Schedule[];for(const schedule of schedules){try{await this.runSchedule(schedule);}catch(error){const limited=error instanceof GenesysError&&error.status===429;db.prepare("UPDATE library_schedules SET run_status=?,run_requested=CASE WHEN ? THEN run_requested ELSE 0 END,last_error=?,updated_at=? WHERE id=?").run(limited?'queued':'failed',Number(limited),safeError(error),this.now().toISOString(),schedule.id);if(limited)break;}}}finally{this.running=false;}}
   private now(){return this.deps.now?.()||new Date();}
   private async runSchedule(schedule:Schedule){
     const now=this.now();
@@ -72,7 +72,7 @@ export class LibraryArchiveWorker {
     const stillPending=Number((db.prepare("SELECT COUNT(*) AS n FROM library_archive_queue WHERE schedule_id=? AND status='pending' AND attempts<5").get(schedule.id) as {n:number}).n);
     const refreshed=db.prepare('SELECT * FROM library_schedules WHERE id=?').get(schedule.id) as Schedule;
     if(!stillPending&&refreshed.backfill_complete&&Date.parse(refreshed.cursor_at)>=now.getTime()-60000){
-      if(Date.parse(refreshed.next_run_at)<=now.getTime()){const next=nextScheduleTime(refreshed,now);db.prepare("UPDATE library_schedules SET next_run_at=?,run_status='idle',last_finished_at=?,updated_at=? WHERE id=?").run(next,now.toISOString(),now.toISOString(),schedule.id);}
+      if(Date.parse(refreshed.next_run_at)<=now.getTime()){const next=nextScheduleTime(refreshed,now);db.prepare("UPDATE library_schedules SET next_run_at=?,run_requested=0,run_status='idle',last_finished_at=?,updated_at=? WHERE id=?").run(next,now.toISOString(),now.toISOString(),schedule.id);}
     }else if(!stillPending&&refreshed.backfill_complete){db.prepare("UPDATE library_schedules SET run_status='idle',last_finished_at=?,updated_at=? WHERE id=?").run(now.toISOString(),now.toISOString(),schedule.id);}
     else if(!stillPending){db.prepare("UPDATE library_schedules SET run_status='queued',updated_at=? WHERE id=?").run(now.toISOString(),schedule.id);}
   }
@@ -80,7 +80,7 @@ export class LibraryArchiveWorker {
     const client=this.clientFor(schedule.connection_id);
     const due=Date.parse(schedule.next_run_at)<=now.getTime();
     if(schedule.backfill_complete&&!due)return;
-    let cursor=Date.parse(schedule.cursor_at);if(!Number.isFinite(cursor))cursor=Date.UTC(2000,0,1);
+    let cursor=Date.parse(schedule.cursor_at);const earliest=Date.parse(initialArchiveCursor(now));if(!Number.isFinite(cursor)||cursor<earliest)cursor=earliest;
     const targetTime=now.getTime();
     for(let window=0;window<WINDOWS_PER_TICK&&cursor<targetTime;window++){
       const end=Math.min(targetTime,cursor+DAY);const interval=`${new Date(cursor).toISOString()}/${new Date(end).toISOString()}`;

@@ -15,10 +15,20 @@ import { checkPasswordPolicy, isPasswordPolicySatisfied } from '../password-poli
 import { parseSmtpSettings, publicSmtpSettings } from '../mailer.js';
 import { DEFAULT_RECORDING_OUTPUT_FORMAT, ffmpegArguments, parseRecordingOutputFormat, preferredGenesysInputFormat, recordingOutputInfo, transcodeRecordingAudio, RECORDING_OUTPUT_FORMATS } from '../audio-transcode.js';
 import { execFileSync } from 'node:child_process';
+import { libraryTabFromPath, pathForLibraryTab } from '../../src/library-navigation.js';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
   afterAll(() => { delete process.env.MASTER_ENCRYPTION_KEY; });
+
+  it('maps Sound Library routes and tabs in both directions',()=>{
+    expect(libraryTabFromPath('/library')).toBe('library');
+    expect(libraryTabFromPath('/library/schedules')).toBe('schedules');
+    expect(libraryTabFromPath('/library/settings')).toBe('settings');
+    expect(pathForLibraryTab('library')).toBe('/library');
+    expect(pathForLibraryTab('schedules')).toBe('/library/schedules');
+    expect(pathForLibraryTab('settings')).toBe('/library/settings');
+  });
 
   it('loads all Analytics conversation pages and deduplicates repeated conversations', async () => {
     const requests: { interval: string; pageNumber: number; pageSize: number }[] = [];

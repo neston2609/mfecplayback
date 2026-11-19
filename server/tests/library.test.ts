@@ -4,8 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { encrypt, decrypt } from '../security.js';
-import { assertLocalDestinationPath, destinationSchema, destinationConfigJson, decryptDestination, publicDestination } from '../library-destinations.js';
-import { nextScheduleTime } from '../library-schedule.js';
+import { assertLocalDestinationPath, destinationSchema, destinationConfigJson, decryptDestination, localFilesystemCapacity, publicDestination } from '../library-destinations.js';
+import { initialArchiveCursor, nextScheduleTime } from '../library-schedule.js';
 
 describe('Sound Library schedule and storage security',()=>{
   const oldRoot=process.env.LIBRARY_STORAGE_ROOT;let root='';
@@ -35,6 +35,14 @@ describe('Sound Library schedule and storage security',()=>{
     expect(nextScheduleTime({cadence:'daily',day_of_week:null,day_of_month:null,run_time:'02:00',time_zone:'Asia/Bangkok'},after)).toBe('2026-11-19T19:00:00.000Z');
     expect(nextScheduleTime({cadence:'weekly',day_of_week:1,day_of_month:null,run_time:'02:00',time_zone:'Asia/Bangkok'},after)).toBe('2026-11-22T19:00:00.000Z');
     expect(nextScheduleTime({cadence:'monthly',day_of_week:null,day_of_month:31,run_time:'02:00',time_zone:'UTC'},new Date('2026-02-28T23:00:00.000Z'))).toBe('2026-03-31T02:00:00.000Z');
+  });
+
+  it('starts historical archive within Genesys Analytics retention and reads local OS capacity',async()=>{
+    const now=new Date('2026-11-19T18:42:00.000Z'),cursor=initialArchiveCursor(now),expected=new Date(Date.UTC(2026,10,19)-550*86400000).toISOString();
+    expect(cursor).toBe(expected);
+    const capacity=await localFilesystemCapacity(root);
+    expect(capacity?.totalBytes).toBeGreaterThan(0);
+    expect(capacity?.freeBytes).toBeGreaterThan(0);
   });
 
   it('keeps library records independent from existing application tables',()=>{

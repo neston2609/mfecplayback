@@ -1,5 +1,11 @@
 const DAY=86400000;
+export const GENESYS_ANALYTICS_LOOKBACK_DAYS=550;
 export type ScheduleTiming={cadence:'daily'|'weekly'|'monthly';day_of_week:number|null;day_of_month:number|null;run_time:string;time_zone:string};
+
+export function initialArchiveCursor(now=new Date()){
+  const startOfUtcDay=Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate());
+  return new Date(startOfUtcDay-GENESYS_ANALYTICS_LOOKBACK_DAYS*DAY).toISOString();
+}
 
 export function nextScheduleTime(schedule:ScheduleTiming, after:Date) {
   const [hour,minute]=schedule.run_time.split(':').map(Number);

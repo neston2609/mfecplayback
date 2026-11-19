@@ -12,6 +12,15 @@ import crypto from 'node:crypto';
 
 export const DEFAULT_LIBRARY_PATH = process.env.LIBRARY_STORAGE_ROOT || '/var/lib/mfec-recording-explorer/library';
 export function assertLocalDestinationPath(destinationPath:string,rootPath=process.env.LIBRARY_STORAGE_ROOT||'/var/lib/mfec-recording-explorer/library'){const root=path.resolve(rootPath),configured=path.resolve(destinationPath||root);if(configured!==root&&!configured.startsWith(`${root}${path.sep}`))throw new Error(`Local destinations must stay under the configured library root (${root}).`);return configured;}
+export async function localFilesystemCapacity(destinationPath:string):Promise<{totalBytes:number;freeBytes:number}|null>{
+  try{
+    const root=path.resolve(process.env.LIBRARY_STORAGE_ROOT||DEFAULT_LIBRARY_PATH),configured=assertLocalDestinationPath(destinationPath,root),realRoot=await fs.realpath(root),realConfigured=await fs.realpath(configured);
+    if(realConfigured!==realRoot&&!realConfigured.startsWith(`${realRoot}${path.sep}`))return null;
+    const stats=await fs.statfs(realConfigured),blockSize=Number(stats.bsize);
+    if(!Number.isFinite(blockSize)||blockSize<=0)return null;
+    return {totalBytes:Number(stats.blocks)*blockSize,freeBytes:Number(stats.bavail)*blockSize};
+  }catch{return null;}
+}
 
 const hostSchema = z.string().trim().min(1).max(253).refine(value => !/[\s/@?#]/.test(value), 'Enter a host name or IP address, not a URL.');
 const remotePathSchema=z.string().trim().max(500).refine(value=>!value.replace(/\\/g,'/').split('/').includes('..'),'Remote path cannot contain parent-directory traversal.');

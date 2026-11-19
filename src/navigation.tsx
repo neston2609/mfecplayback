@@ -13,13 +13,13 @@ export function NavigationSidebar({mobile,path,user,autoCollapseSubmenu,onNaviga
   const [openGroup,setOpenGroup]=useState('');
   return <aside className={`sidebar ${mobile?'sidebar-open':''}`}>
     {navGroups.map(group=>{
-      const visibleItems=group.items.filter(([label])=>label!=='Genesys Regions'||user.role==='administrator');
+      const visibleItems=group.items.filter(([label])=>(label!=='Genesys Regions'&&label!=='Schedule Archive'&&label!=='Library Setting')||user.role==='administrator');
       const expanded=!autoCollapseSubmenu||openGroup===group.title;
       return <div className="nav-group" key={group.title}>
         <button className="nav-group-toggle" aria-expanded={expanded} onClick={()=>autoCollapseSubmenu&&setOpenGroup(openGroup===group.title?'':group.title)}>
           <span>{group.title}</span><ChevronDown size={14} className={expanded?'nav-chevron-open':''}/>
         </button>
-        {expanded&&<div className="nav-group-items">{visibleItems.map(([label,href,Icon])=><button key={href} className={`nav-item ${path===href?'active':''}`} onClick={()=>onNavigate(href)}><Icon size={17}/><span>{label}</span>{label==='Audit Logs'&&<span className="nav-dot"/>}</button>)}</div>}
+         {expanded&&<div className="nav-group-items">{visibleItems.map(([label,href,Icon])=><button key={href} className={`nav-item ${path===href?'active':''}`} onClick={()=>onNavigate(href)}><Icon size={17}/><span>{label}</span>{label==='Audit Logs'&&<span className="nav-dot"/>}</button>)}</div>}
       </div>;
     })}
     <div className="sidebar-bottom"><div className="secure-note"><Shield size={15}/><span><b>Secure workspace</b><small>Activity is audited</small></span></div><div className="side-version">MFEC Recording Explorer <span>v{__APP_VERSION__}</span></div></div>

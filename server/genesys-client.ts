@@ -106,7 +106,8 @@ export class GenesysClient {
         }
       }
       await response.body?.cancel().catch(()=>{});
-      throw new GenesysError(response.status, response.status === 403 ? 'Genesys denied access. Verify service-account permissions and recording/division access.' : `Genesys API request failed (HTTP ${response.status}).`);
+      const message=response.status===403?'Genesys denied access. Verify service-account permissions and recording/division access.':response.status===400?'Genesys rejected the request (HTTP 400). Check the Analytics date interval and query filters.':`Genesys API request failed (HTTP ${response.status}).`;
+      throw new GenesysError(response.status,message);
     }
     throw new Error('Genesys API request failed after retries.');
   }

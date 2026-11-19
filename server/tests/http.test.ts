@@ -14,6 +14,7 @@ let cookie = '';
 let csrf = '';
 let serverOutput = '';
 let ffmpegFixture = '';
+let integrationDatabasePath='';
 
 async function freePort() {
   const socket = net.createServer();
@@ -64,7 +65,7 @@ describe('HTTP API security and Mock Mode flows', () => {
         SESSION_SECRET: 'integration-test-session-secret-with-sufficient-entropy',
         ...(process.env.FFMPEG_PATH ? { FFMPEG_PATH: process.env.FFMPEG_PATH } : {}),
         MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 17).toString('base64'),
-        DATABASE_PATH: path.join(testDirectory, 'integration.sqlite'),
+        DATABASE_PATH: integrationDatabasePath=path.join(testDirectory, 'integration.sqlite'),
         LIBRARY_STORAGE_ROOT: path.join(testDirectory,'library-storage'),
         INITIAL_ADMIN_USERNAME: 'integration-admin', INITIAL_ADMIN_PASSWORD: 'Integration-Test-Password-456!',
       },
@@ -140,8 +141,25 @@ describe('HTTP API security and Mock Mode flows', () => {
     const savedDestinationBody=await savedDestination.json() as {destination:Record<string,unknown>};
     expect(savedDestinationBody.destination).toMatchObject({name:'Integration archive',type:'local',retentionDays:30});
     expect(savedDestinationBody.destination).not.toHaveProperty('password');
+    const destinationList=await (await request('/api/library/destinations')).json() as {destinations:{id:string;storageTotalBytes:number;storageFreeBytes:number;archivedBytes:number}[]};
+    expect(destinationList.destinations[0]).toMatchObject({id:savedDestinationBody.destination.id,archivedBytes:0});
+    expect(destinationList.destinations[0].storageTotalBytes).toBeGreaterThan(0);
+    expect(destinationList.destinations[0].storageFreeBytes).toBeGreaterThan(0);
     const mockSchedule=await request('/api/library/schedules',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Backfill',connectionId:'00000000-0000-4000-8000-000000000001',destinationId:'00000000-0000-4000-8000-000000000002',cadence:'daily',runTime:'02:00',timeZone:'Asia/Bangkok'})},true);
     expect(mockSchedule.status).toBe(409);
+
+    const scheduleDb=new Database(integrationDatabasePath);
+    const mockConnectionId='00000000-0000-4000-8000-000000000011',scheduleId='00000000-0000-4000-8000-000000000012',now=new Date().toISOString();
+    scheduleDb.prepare('INSERT INTO connections(id,name,organization_label,region_id,api_base_url,oauth_base_url,client_id,client_secret_enc,enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,0,?,?)').run(mockConnectionId,'Run-now test','test','us-east-1','https://api.mypurecloud.com','https://login.mypurecloud.com','test-client','',now,now);
+    scheduleDb.prepare("INSERT INTO library_schedules(id,name,connection_id,destination_id,cadence,run_time,time_zone,enabled,cursor_at,backfill_complete,next_run_at,run_status,created_at,updated_at) VALUES(?,?,?,?,'daily','02:00','UTC',0,?,1,?,'idle',?,?)").run(scheduleId,'Paused run-now test',mockConnectionId,savedDestinationBody.destination.id,now,now,now,now);
+    scheduleDb.close();
+    expect((await request(`/api/library/schedules/${scheduleId}/run-now`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'})).status).toBe(403);
+    const runNow=await request(`/api/library/schedules/${scheduleId}/run-now`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'},true);
+    expect(runNow.status).toBe(200);
+    expect(await runNow.json()).toMatchObject({ok:true,queued:true});
+    const verifyDb=new Database(integrationDatabasePath,{readonly:true});
+    expect(verifyDb.prepare('SELECT enabled,run_requested,run_status FROM library_schedules WHERE id=?').get(scheduleId)).toMatchObject({enabled:0,run_requested:0,run_status:'failed'});
+    verifyDb.close();
 
     const noCsrf = await request('/api/recordings/search', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     expect(noCsrf.status).toBe(403);
