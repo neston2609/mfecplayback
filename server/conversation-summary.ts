@@ -83,6 +83,62 @@ export function withParticipantLines(conversation: any, userNames: Record<string
   };
 }
 
+export function collectQueueIds(conversation: any): string[] {
+  const ids = new Set<string>();
+  for (const participant of Array.isArray(conversation?.participants) ? conversation.participants : []) {
+    const participantQueueId = typeof participant?.queueId === 'string' ? participant.queueId : '';
+    if (participantQueueId && UUID.test(participantQueueId)) ids.add(participantQueueId);
+    for (const session of Array.isArray(participant?.sessions) ? participant.sessions : []) {
+      const sessionQueueId = typeof session?.queueId === 'string' ? session.queueId : '';
+      if (sessionQueueId && UUID.test(sessionQueueId)) ids.add(sessionQueueId);
+      for (const segment of Array.isArray(session?.segments) ? session.segments : []) {
+        const segmentQueueId = typeof segment?.queueId === 'string' ? segment.queueId : '';
+        if (segmentQueueId && UUID.test(segmentQueueId)) ids.add(segmentQueueId);
+      }
+    }
+  }
+  return [...ids];
+}
+
+export function conversationQueueNames(conversation: any, resolvedNames: Record<string, string> = {}): string[] {
+  const names = new Set<string>();
+  for (const [id, value] of Object.entries(resolvedNames)) {
+    if (!UUID.test(id)) continue;
+    const name = readableName(value);
+    if (name) names.add(name);
+  }
+  for (const participant of Array.isArray(conversation?.participants) ? conversation.participants : []) {
+    const purpose = String(participant?.purpose || '').toLowerCase();
+    if (purpose === 'acd') {
+      const name = readableName(participant?.participantName);
+      if (name && !['acd', 'queue'].includes(name.toLowerCase())) names.add(name);
+    }
+    for (const session of Array.isArray(participant?.sessions) ? participant.sessions : []) {
+      const sessionName = readableName(session?.queueName);
+      if (sessionName) names.add(sessionName);
+      for (const segment of Array.isArray(session?.segments) ? session.segments : []) {
+        const segmentName = readableName(segment?.queueName);
+        if (segmentName) names.add(segmentName);
+      }
+    }
+  }
+  return [...names];
+}
+
+export function conversationWrapUpCodeNames(conversation: any): string[] {
+  const names = new Set<string>();
+  for (const participant of Array.isArray(conversation?.participants) ? conversation.participants : []) {
+    for (const session of Array.isArray(participant?.sessions) ? participant.sessions : []) {
+      for (const segment of Array.isArray(session?.segments) ? session.segments : []) {
+        const candidates = [segment?.wrapUpCodeName, segment?.wrapUpCode?.name, segment?.wrapUpCode];
+        const name = candidates.map(readableName).find(value => value && value !== 'Wrap-up code unavailable');
+        if (name) names.add(name);
+      }
+    }
+  }
+  return [...names];
+}
+
 function firstPhone(participants: any[], field: 'ani' | 'dnis'): string {
   const ordered = [...participants].sort((a, b) => Number(b?.purpose === 'customer') - Number(a?.purpose === 'customer'));
   for (const participant of ordered) {
@@ -112,8 +168,9 @@ export function summarizeConversation(conversation: any, userNames: Record<strin
   const participants = conversation?.participants || [];
   const agents = new Set<string>();
   const flows = new Set<string>();
-  const queues = new Set<string>();
-  let wrapUp = '';
+  const queues = new Set(conversationQueueNames(conversation));
+  const wrapUpNames = conversationWrapUpCodeNames(conversation);
+  const wrapUp = wrapUpNames[wrapUpNames.length - 1] || '';
 
   for (const participant of participants) {
     const participantName = readableName(participant?.participantName);
@@ -131,7 +188,6 @@ export function summarizeConversation(conversation: any, userNames: Record<strin
 
     for (const session of participant?.sessions || []) {
       if (session?.queueName) queues.add(session.queueName);
-      for (const segment of session?.segments || []) if (segment?.wrapUpCode) wrapUp = segment.wrapUpCode;
     }
   }
 

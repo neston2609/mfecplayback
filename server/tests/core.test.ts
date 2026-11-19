@@ -5,7 +5,7 @@ import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
 import { queryAllConversations, VOICE_RECORDING_FILTERS } from '../conversation-query.js';
-import { participantLines, summarizeConversation, withParticipantLines } from '../conversation-summary.js';
+import { collectQueueIds, conversationQueueNames, conversationWrapUpCodeNames, participantLines, summarizeConversation, withParticipantLines } from '../conversation-summary.js';
 import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceInteraction, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaRequestPath, recordingMetadataRequestPath, recordingMediaUriForFormats, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
@@ -113,6 +113,23 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
       {purpose:'agent',sessions:[{callbackNumbers:['+66999999999']}]},
     ]});
     expect(result).toMatchObject({direction:'outbound',callbackNumber:'+66812345678',ani:''});
+  });
+
+  it('includes transferred ACD queues and only readable wrap-up code names in the overview',()=>{
+    const wrapUpId='2816e6e2-0c0b-4a90-a147-61e20f80435d';
+    const conversation={participants:[
+      {purpose:'acd',participantName:'Customer Care',sessions:[{segments:[]}]},
+      {purpose:'agent',participantName:'Agent A',sessions:[{segments:[{wrapUpCode:wrapUpId,wrapUpCodeName:'Issue Resolved'}]}]},
+      {purpose:'agent',sessions:[{segments:[{wrapUpCode:'748a0ed1-839f-48e7-b328-fd769f10d54d'}]}]},
+    ]};
+    expect(conversationQueueNames(conversation)).toEqual(['Customer Care']);
+    expect(conversationWrapUpCodeNames(conversation)).toEqual(['Issue Resolved']);
+    expect(summarizeConversation(conversation).wrapUp).toBe('Issue Resolved');
+    const queueId='eb13c121-2f73-4f10-b8da-3a550b0b4d29';
+    const transfer={participants:[{purpose:'acd',sessions:[{queueId}]}]};
+    expect(collectQueueIds(transfer)).toEqual([queueId]);
+    expect(conversationQueueNames(transfer,{[queueId]:'Customer Care'})).toEqual(['Customer Care']);
+    expect(conversationQueueNames(transfer)).toEqual([]);
   });
 
   it('formats participant labels in Genesys order using customer numbers, flow names, and resolved agent names', () => {

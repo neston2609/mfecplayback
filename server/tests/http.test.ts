@@ -216,7 +216,7 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(await conversationRecordings.json()).toMatchObject([{id:'demo-recording-1',mediaType:'voice'}]);
     const mockConversationDetails=await request('/api/recordings/conversations/demo-ava-agent-001?connectionId=mock');
     expect(mockConversationDetails.status).toBe(200);
-    expect(await mockConversationDetails.json()).toMatchObject({conversationId:'demo-ava-agent-001',wrapUpNotes:[{agent:'Nicha S.',note:'Customer confirmed the issue was resolved after the account settings were updated.'}]});
+    expect(await mockConversationDetails.json()).toMatchObject({conversationId:'demo-ava-agent-001',queues:['Customer Care'],wrapUpCodes:['Resolved'],wrapUpNotes:[{agent:'Nicha S.',note:'Customer confirmed the issue was resolved after the account settings were updated.'}]});
     const mockSummaries=await request('/api/recordings/conversations/demo-ava-agent-001/summaries?connectionId=mock');
     expect(mockSummaries.status).toBe(501);
     const mockTranscription=await request('/api/recordings/conversations/demo-ava-agent-001/transcription?connectionId=mock');
