@@ -6,7 +6,7 @@ import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
 import { queryAllConversations, VOICE_RECORDING_FILTERS } from '../conversation-query.js';
 import { participantLines, summarizeConversation, withParticipantLines } from '../conversation-summary.js';
-import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceInteraction, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaRequestPath, recordingMetadataRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
+import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceInteraction, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaRequestPath, recordingMetadataRequestPath, recordingMediaUriForFormats, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from '../wrapup.js';
@@ -105,6 +105,14 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     },{'eb13c121-2f73-4f10-b8da-3a550b0b4d29':'Nicha Agent'});
 
     expect(result).toMatchObject({agents:['Nicha Agent'],flows:[],ani:'',dnis:'+6621234567',direction:'outbound',interactionType:'Human Agent'});
+  });
+
+  it('provides the outbound callback number for display in the Direction column',()=>{
+    const result=summarizeConversation({conversationId:'outbound-callback',originatingDirection:'outbound',participants:[
+      {purpose:'customer',sessions:[{ani:'sip:route@localhost',callbackNumbers:['tel:+66812345678']}]},
+      {purpose:'agent',sessions:[{callbackNumbers:['+66999999999']}]},
+    ]});
+    expect(result).toMatchObject({direction:'outbound',callbackNumber:'+66812345678',ani:''});
   });
 
   it('formats participant labels in Genesys order using customer numbers, flow names, and resolved agent names', () => {
@@ -299,6 +307,10 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(strict?.mediaUri).toContain('/mp3?');
     const mismatch = await getRecordingMedia({ async get<T>(endpoint:string):Promise<T>{return (endpoint.endsWith('/recordings') ? [{id:'strict-recording',mediaUris:{WEBM:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/webm?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'}}}] : {mediaUris:{}}) as T;}},'conversation','strict-recording',async()=>undefined,'MP3');
     expect(mismatch).toBeUndefined();
+    const alternateFormat = await getRecordingMedia({ async get<T>():Promise<T>{return {mediaUris:{FLAC:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/flac?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'},MP3:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/mp3?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'}}} as T;}},'conversation','alternate-recording',async()=>undefined,'WEBM',['WEBM','MP3','WAV'],false);
+    expect(alternateFormat?.mediaUri).toContain('/mp3?');
+    expect(recordingMediaUriForFormats({mediaUris:{FLAC:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/flac'},WAV:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/wav'}}},['WEBM','MP3','WAV'])).toContain('/wav');
+    expect(recordingMediaUriForFormats({mediaUri:'https://prod-recording-playback.s3.amazonaws.com/unknown'},['WEBM','MP3','WAV'])).toBeUndefined();
     const formatless = await getRecordingMedia({ async get<T>(endpoint:string):Promise<T>{return (endpoint.endsWith('/recordings') ? [{id:'strict-recording',mediaUri:'https://prod-recording-playback.s3.amazonaws.com/unknown?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'}] : {mediaUris:{}}) as T;}},'conversation','strict-recording',async()=>undefined,'MP3');
     expect(formatless).toBeUndefined();
     let attempts = 0;

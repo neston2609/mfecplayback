@@ -94,6 +94,20 @@ function firstPhone(participants: any[], field: 'ani' | 'dnis'): string {
   return '';
 }
 
+function firstCallbackNumber(participants: any[]): string {
+  const ordered=[...participants].sort((a,b)=>Number(b?.purpose==='customer')-Number(a?.purpose==='customer'));
+  for(const participant of ordered){
+    for(const session of participant?.sessions||[]){
+      const values=Array.isArray(session?.callbackNumbers)?session.callbackNumbers:[session?.callbackNumbers];
+      for(const value of values){
+        const phone=readablePhone(typeof value==='string'?value:value?.callbackNumber||value?.number||value?.value);
+        if(phone)return phone;
+      }
+    }
+  }
+  return '';
+}
+
 export function summarizeConversation(conversation: any, userNames: Record<string, string> = {}) {
   const participants = conversation?.participants || [];
   const agents = new Set<string>();
@@ -127,6 +141,7 @@ export function summarizeConversation(conversation: any, userNames: Record<strin
     conversationStart: conversation.conversationStart,
     conversationEnd: conversation.conversationEnd,
     direction: conversation.originatingDirection || 'unknown',
+    callbackNumber: firstCallbackNumber(participants),
     ani: firstPhone(participants, 'ani'),
     dnis: firstPhone(participants, 'dnis'),
     agents: [...agents],

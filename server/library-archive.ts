@@ -6,7 +6,7 @@ import { db } from './db/index.js';
 import { connectionById, type Connection } from './genesys.js';
 import { GenesysClient, GenesysError } from './genesys-client.js';
 import { decryptDestination, deleteDestinationFile, readDestinationFile, readDestinationFileBuffer, writeDestinationFile, type DestinationRow } from './library-destinations.js';
-import { getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, validateRecordingMediaUrl } from './recording-media.js';
+import { getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaUriForFormats, validateRecordingMediaUrl } from './recording-media.js';
 import { summarizeConversation } from './conversation-summary.js';
 import { extractSingleAudioFromZip } from './zip-audio.js';
 import { initialArchiveCursor, nextScheduleTime } from './library-schedule.js';
@@ -33,9 +33,19 @@ function extensionFor(mimeType:string, metadata:any) {
 }
 
 async function getMediaBytes(client:GenesysClient,connection:Connection,conversationId:string,recordingId:string,fetchMedia:typeof fetch,inputFormat='WEBM') {
-  const playable=await getRecordingMedia(client,conversationId,recordingId,undefined,inputFormat);if(!playable)return undefined;
-  const mediaUris=playable.metadata?.mediaUris;
-  if(mediaUris&&typeof mediaUris==='object'&&!Array.isArray(mediaUris)&&!Object.keys(mediaUris).some(key=>genesysMediaFormatKey(key)===genesysMediaFormatKey(inputFormat)))return undefined;
+  const fallbackFormats=['WEBM','MP3','WAV','WAV_ULAW','OGG_OPUS','OGG_VORBIS','M4A','MP4'];
+  let playable;
+  try{playable=await getRecordingMedia(client,conversationId,recordingId,undefined,inputFormat,fallbackFormats,false);}
+  catch(error){
+    if(!(error instanceof GenesysError&&[400,404].includes(error.status)))throw error;
+    const fallbacks=fallbackFormats.filter(format=>genesysMediaFormatKey(format)!==genesysMediaFormatKey(inputFormat));
+    for(const format of fallbacks){
+      try{playable=await getRecordingMedia(client,conversationId,recordingId,undefined,format,fallbackFormats,false);if(playable)break;}
+      catch(fallbackError){if(!(fallbackError instanceof GenesysError&&[400,404].includes(fallbackError.status)))throw fallbackError;}
+    }
+    if(!playable)throw error;
+  }
+  if(!playable)return undefined;
   let voiceContext:any;
   if(!(typeof playable.metadata?.mediaType==='string'&&playable.metadata.mediaType.toLowerCase()==='voice'))voiceContext=await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`);
   if(!isVoiceRecording(playable.metadata,voiceContext)||isMessageRecording(playable.metadata))return undefined;
