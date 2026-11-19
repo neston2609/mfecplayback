@@ -93,6 +93,18 @@ All state-changing API calls except login require the session CSRF token in `x-c
 
 The SQLite schema is in `server/db/schema.sql`. It covers users, role column, organization access grants, connections, bot/flow registry, saved searches, preferences, customer mappings, optional conversation metadata index, audit logs, application settings, and sessions. Audio is never persisted. SQLite is for development/single instance; a multi-instance production install should migrate to PostgreSQL and a shared session store before scaling horizontally.
 
+## Application versioning
+
+The sidebar version is built from the root `package.json` version, so it is not maintained separately in the UI. Bump it once for each CR using the matching command before building/deploying:
+
+| CR size | Command | Version change |
+| --- | --- | --- |
+| High Effort | `npm run version:high-effort` | `x + 1`, reset `y.z` to `0.0` |
+| Small CR | `npm run version:small` | `y + 1`, reset `z` to `0` |
+| UI/appearance-only CR | `npm run version:ui` | `z + 1` |
+
+For example, from `1.8.6` these produce `2.0.0`, `1.9.0`, and `1.8.7`. Commit the updated `package.json` and `package-lock.json` with the CR; the client build automatically displays the resulting version.
+
 ## Deployment (Ubuntu, no Docker required)
 
 1. Install Node.js 20+, create a dedicated `recording-explorer` service user, and deploy source to `/opt/mfec-recording-explorer`.

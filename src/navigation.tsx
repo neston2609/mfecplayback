@@ -22,10 +22,11 @@ export function NavigationSidebar({mobile,path,user,autoCollapseSubmenu,onNaviga
         {expanded&&<div className="nav-group-items">{visibleItems.map(([label,href,Icon])=><button key={href} className={`nav-item ${path===href?'active':''}`} onClick={()=>onNavigate(href)}><Icon size={17}/><span>{label}</span>{label==='Audit Logs'&&<span className="nav-dot"/>}</button>)}</div>}
       </div>;
     })}
-    <div className="sidebar-bottom"><div className="secure-note"><Shield size={15}/><span><b>Secure workspace</b><small>Activity is audited</small></span></div><div className="side-version">MFEC Recording Explorer <span>v1.0.0</span></div></div>
+    <div className="sidebar-bottom"><div className="secure-note"><Shield size={15}/><span><b>Secure workspace</b><small>Activity is audited</small></span></div><div className="side-version">MFEC Recording Explorer <span>v{__APP_VERSION__}</span></div></div>
   </aside>;
 }
 
 export function navTitle(path:string){return navGroups.reduce<string|undefined>((found,group)=>found||group.items.find(([,href])=>href===path)?.[0],undefined)||'Recording Search';}
 export function AppFooter(){return <footer className="app-footer"><span>Developed by MFEC Public Company</span><span>Last updated: {__BUILD_DATE__}</span></footer>;}
 declare const __BUILD_DATE__:string;
+declare const __APP_VERSION__:string;

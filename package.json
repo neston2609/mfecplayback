@@ -1,11 +1,14 @@
 {
   "name": "mfec-recording-explorer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "concurrently -k \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
     "build": "tsc -b && vite build && tsc -p tsconfig.server.json && node -e \"require('node:fs').copyFileSync('server/db/schema.sql','dist-server/server/db/schema.sql')\"",
+    "version:high-effort": "tsx scripts/bump-version.ts high-effort",
+    "version:small": "tsx scripts/bump-version.ts small",
+    "version:ui": "tsx scripts/bump-version.ts ui",
     "start": "node dist-server/server/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
