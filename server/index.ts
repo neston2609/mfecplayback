@@ -27,6 +27,7 @@ import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from './mock.js';
 import { DEFAULT_LIBRARY_PATH, decryptDestination, destinationConfigJson, destinationSchema, localFilesystemCapacity, publicDestination, testDestination, type DestinationRow } from './library-destinations.js';
 import { archivedRecordingById, archivedRecordingMetadata, archivedRecordingStream, LibraryArchiveWorker, listLibrary, retryFailedArchive } from './library-archive.js';
 import { initialArchiveCursor, nextScheduleTime } from './library-schedule.js';
+import { mapParticipantUserNames, participantUserLookupId } from './participant-users.js';
 import { DEFAULT_RECORDING_OUTPUT_FORMAT, RECORDING_OUTPUT_FORMATS, checkAudioConverter, genesysMediaFormatKey, parseRecordingOutputFormat, preferredGenesysInputFormat, recordingOutputInfo, transcodeRecordingAudio } from './audio-transcode.js';
 
 declare module 'express-session' { interface SessionData { user?: { id: string; username: string; role: string }; csrf?: string } }
@@ -246,6 +247,7 @@ app.delete('/api/library/destinations/:id',requireAuth,requireAdmin,requireCsrf,
 app.get('/api/library/schedules',requireAuth,(req,res,next)=>{
   try{if(req.session.user!.role!=='administrator')throw httpError(403,'Administrator role required.');const schedules=db.prepare('SELECT s.*,c.name AS connection_name,d.name AS destination_name,(SELECT COUNT(*) FROM library_archive_queue q WHERE q.schedule_id=s.id AND q.status=\'pending\') AS pending_count,(SELECT COUNT(*) FROM library_archive_queue q WHERE q.schedule_id=s.id AND q.status=\'failed\') AS failed_count FROM library_schedules s JOIN connections c ON c.id=s.connection_id JOIN library_destinations d ON d.id=s.destination_id ORDER BY s.created_at').all();res.json({schedules});}catch(error){next(error);}
 });
+app.get('/api/library/worker-status',requireAuth,requireAdmin,(req,res)=>res.json(libraryArchiveWorker.status()));
 app.get('/api/library/schedules/:id',requireAuth,requireAdmin,(req,res,next)=>{try{const schedule=db.prepare('SELECT * FROM library_schedules WHERE id=?').get(String(req.params.id));if(!schedule)throw httpError(404,'Schedule not found.');res.json({schedule});}catch(error){next(error);}});
 app.post('/api/library/schedules',requireAuth,requireAdmin,requireCsrf,(req,res,next)=>{
   try{const input=scheduleSchema.parse(req.body),connection=connectionById(input.connectionId,req.session.user!.id,req.session.user!.role);if(!db.prepare('SELECT id FROM library_destinations WHERE id=?').get(input.destinationId))throw httpError(400,'Choose an existing destination.');const now=new Date(),id=crypto.randomUUID(),cursor=initialArchiveCursor(now),nextRun=nextScheduleTime({cadence:input.cadence,day_of_week:input.dayOfWeek??null,day_of_month:input.dayOfMonth??null,run_time:input.runTime,time_zone:input.timeZone},now);db.prepare("INSERT INTO library_schedules(id,name,connection_id,destination_id,cadence,day_of_week,day_of_month,run_time,time_zone,enabled,cursor_at,backfill_complete,next_run_at,run_status,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,0,?,'queued',?,?,?)").run(id,input.name,connection.id,input.destinationId,input.cadence,input.dayOfWeek??null,input.dayOfMonth??null,input.runTime,input.timeZone,cursor,nextRun,req.session.user!.id,now.toISOString(),now.toISOString());audit(req,'LIBRARY_SCHEDULE_CREATE','SUCCESS',connection.id,undefined,undefined,{scheduleId:id,cadence:input.cadence});void libraryArchiveWorker.tick();res.status(201).json({ok:true,id,cursorAt:cursor});}catch(error){next(error);}
@@ -484,9 +486,9 @@ app.post('/api/recordings/search', requireAuth, requireCsrf, rateLimit({windowMs
       for(const participant of c.participants||[]){
         const participantName=typeof participant?.participantName==='string'?participant.participantName:'';
         const userId=typeof participant?.userId==='string'?participant.userId:'';
-        const isAgent=participant?.purpose==='agent';
+        const isAgent=String(participant?.purpose||'').toLowerCase()==='agent';
         const unknownName=isAgent&&(!participantName||/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(participantName));
-        const lookupId=isAgent?(userId||(unknownName?participantName:'')):'';
+        const lookupId=participantUserLookupId(participant)||(isAgent&&unknownName?participantName:'');
         if(client&&lookupId){
           let name=clientUserNames.get(lookupId);
           if(name===undefined){
@@ -495,6 +497,7 @@ app.post('/api/recordings/search', requireAuth, requireCsrf, rateLimit({windowMs
             clientUserNames.set(lookupId,name||'');
           }
           if(name)users[lookupId]=name;
+          if(unknownName&&name)users[participantName]=name;
           if(unknownName&&name)users[participantName]=name;
         }
       }
@@ -728,13 +731,6 @@ function purgeExpiredAuditLogs(){const cutoff=new Date(Date.now()-getAuditRetent
 function escapeLike(value:string){return value.replace(/[\\%_]/g,'\\$&');}
 function redactSensitiveMetadata(value:any):any{if(Array.isArray(value))return value.map(redactSensitiveMetadata);if(value&&typeof value==='object'){const safe:Record<string,unknown>={};for(const [key,item] of Object.entries(value)){if(/token|secret|authorization|mediaUri|signed|url/i.test(key))safe[key]='[REDACTED]';else safe[key]=redactSensitiveMetadata(item);}return safe;}return value;}
 async function mapWrapUpNames(client:GenesysClient,conversation:any){const ids=collectWrapUpCodeIds(conversation);if(!ids.length)return conversation;const entries=await mapWithConcurrency(ids,4,async id=>{try{const code=await client.get<{id?:string;name?:string}>(`/api/v2/routing/wrapupcodes/${encodeURIComponent(id)}`);return [id,typeof code?.name==='string'&&code.name.trim()?code.name:undefined] as const;}catch(error){if(error instanceof GenesysError&&[403,404].includes(error.status))return [id,undefined] as const;throw error;}});return withWrapUpCodeNames(conversation,Object.fromEntries(entries.filter((entry):entry is readonly [string,string]=>Boolean(entry[1]))));}
-async function mapParticipantUserNames(client:GenesysClient,conversation:any){
-  const userIds:string[]=[...new Set<string>((conversation?.participants||[]).filter((participant:any)=>participant?.purpose==='agent'&&typeof participant?.userId==='string'&&participant.userId).map((participant:any)=>participant.userId as string))];
-  if(!userIds.length)return conversation;
-  const entries=await mapWithConcurrency(userIds,4,async id=>{try{const user=await client.get<any>(`/api/v2/users/${encodeURIComponent(id)}`);const name=typeof user?.name==='string'&&user.name.trim()?user.name.trim():[user?.firstName,user?.lastName].filter(Boolean).join(' ').trim();return [id,name] as const;}catch(error){if(error instanceof GenesysError&&[403,404].includes(error.status))return [id,''] as const;throw error;}});
-  const names=Object.fromEntries(entries);
-  return {...conversation,participants:(conversation.participants||[]).map((participant:any)=>participant?.purpose==='agent'&&names[participant.userId]?{...participant,participantName:names[participant.userId]}:participant)};
-}
 function publicError(error:unknown){if(error instanceof Error)return error.message.slice(0,200);return 'Connection test failed.';}
 function httpError(status:number,message:string){return Object.assign(new Error(message),{status});}
 function getRecordingOutputFormat(){const row=db.prepare("SELECT value_json FROM application_settings WHERE key='recording_output_format'").get() as {value_json:string}|undefined;if(!row)return DEFAULT_RECORDING_OUTPUT_FORMAT;try{return parseRecordingOutputFormat(JSON.parse(row.value_json));}catch{return DEFAULT_RECORDING_OUTPUT_FORMAT;}}

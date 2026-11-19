@@ -14,7 +14,7 @@ import { VOICE_RECORDING_FILTERS } from './conversation-query.js';
 import { DEFAULT_RECORDING_OUTPUT_FORMAT, genesysMediaFormatKey, parseRecordingOutputFormat, preferredGenesysInputFormat, transcodeRecordingAudio, type RecordingOutputFormat } from './audio-transcode.js';
 
 const DAY=86400000, PAGE_SIZE=100, MAX_PAGES_PER_WINDOW=100, WINDOWS_PER_TICK=2, ITEMS_PER_TICK=5;
-type Schedule={id:string;name:string;connection_id:string;destination_id:string;cadence:'daily'|'weekly'|'monthly';day_of_week:number|null;day_of_month:number|null;run_time:string;time_zone:string;enabled:number;cursor_at:string;backfill_complete:number;next_run_at:string;run_status:string;last_started_at:string|null};
+type Schedule={id:string;name:string;connection_id:string;destination_id:string;cadence:'daily'|'weekly'|'monthly';day_of_week:number|null;day_of_month:number|null;run_time:string;time_zone:string;enabled:number;cursor_at:string;backfill_complete:number;next_run_at:string;run_status:string;last_started_at:string|null;run_requested?:number};
 type QueueItem={id:number;schedule_id:string;conversation_id:string;conversation_start:string;attempts:number};
 type ArchiveDeps={clientFor?:(connection:Connection)=>GenesysClient;writeFile?:typeof writeDestinationFile;now?:()=>Date;fetchMedia?:typeof fetch;outputFormat?:()=>RecordingOutputFormat;transcode?:typeof transcodeRecordingAudio};
 
@@ -57,11 +57,19 @@ async function getMediaBytes(client:GenesysClient,connection:Connection,conversa
 }
 
 export class LibraryArchiveWorker {
-  private timer:NodeJS.Timeout|undefined;private running=false;
+  private timer:NodeJS.Timeout|undefined;private running=false;private activeScheduleId:string|undefined;
   constructor(private readonly deps:ArchiveDeps={}){}
   start(){if(this.timer)return;this.timer=setInterval(()=>void this.tick(),30000);this.timer.unref();void this.tick();}
   stop(){if(this.timer)clearInterval(this.timer);this.timer=undefined;}
-  async tick(){if(this.running)return;this.running=true;try{this.purgeExpired().catch(()=>{});const schedules=db.prepare("SELECT * FROM library_schedules WHERE enabled=1 OR run_requested=1 ORDER BY created_at").all() as Schedule[];for(const schedule of schedules){try{await this.runSchedule(schedule);}catch(error){const limited=error instanceof GenesysError&&error.status===429;db.prepare("UPDATE library_schedules SET run_status=?,run_requested=CASE WHEN ? THEN run_requested ELSE 0 END,last_error=?,updated_at=? WHERE id=?").run(limited?'queued':'failed',Number(limited),safeError(error),this.now().toISOString(),schedule.id);if(limited)break;}}}finally{this.running=false;}}
+  status(){
+    const schedules=db.prepare("SELECT s.id,s.name,s.enabled,s.run_status,s.cursor_at,s.backfill_complete,s.last_started_at,s.last_finished_at,s.last_error,s.updated_at,s.run_requested,c.name AS connection_name,d.name AS destination_name,(SELECT COUNT(*) FROM library_archive_queue q WHERE q.schedule_id=s.id AND q.status='pending') AS pending_count,(SELECT COUNT(*) FROM library_archive_queue q WHERE q.schedule_id=s.id AND q.status='failed') AS failed_count FROM library_schedules s JOIN connections c ON c.id=s.connection_id JOIN library_destinations d ON d.id=s.destination_id ORDER BY s.created_at").all() as (Schedule&{connection_name:string;destination_name:string;last_finished_at:string|null;last_error:string|null;updated_at:string;pending_count:number;failed_count:number})[];
+    const isArchiving=Boolean(this.activeScheduleId);
+    const hasQueued=schedules.some(schedule=>Number(schedule.pending_count)>0||schedule.run_status==='queued'||schedule.run_requested===1);
+    const hasFailed=schedules.some(schedule=>Number(schedule.failed_count)>0||schedule.run_status==='failed');
+    const state=isArchiving?'archiving':hasQueued?'queued':hasFailed?'failed':'idle';
+    return {state,checkedAt:this.now().toISOString(),schedules:schedules.map(({run_requested,...schedule})=>({...schedule,run_status:this.activeScheduleId===schedule.id?'running':Number(schedule.pending_count)>0?'queued':Number(schedule.failed_count)>0?'failed':schedule.run_status==='running'?'idle':schedule.run_status}))};
+  }
+  async tick(){if(this.running)return;this.running=true;try{this.purgeExpired().catch(()=>{});const schedules=db.prepare("SELECT * FROM library_schedules WHERE enabled=1 OR run_requested=1 ORDER BY created_at").all() as Schedule[];for(const schedule of schedules){this.activeScheduleId=schedule.id;try{await this.runSchedule(schedule);}catch(error){const limited=error instanceof GenesysError&&error.status===429;db.prepare("UPDATE library_schedules SET run_status=?,run_requested=CASE WHEN ? THEN run_requested ELSE 0 END,last_error=?,updated_at=? WHERE id=?").run(limited?'queued':'failed',Number(limited),safeError(error),this.now().toISOString(),schedule.id);if(limited)break;}finally{this.activeScheduleId=undefined;}}}finally{this.activeScheduleId=undefined;this.running=false;}}
   private now(){return this.deps.now?.()||new Date();}
   private async runSchedule(schedule:Schedule){
     const now=this.now();

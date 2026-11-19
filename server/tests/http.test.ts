@@ -89,6 +89,7 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(anonymous.status).toBe(401);
     expect((await request('/api/library')).status).toBe(401);
     expect((await request('/api/library/destinations')).status).toBe(401);
+    expect((await request('/api/library/worker-status')).status).toBe(401);
     expect((await request('/api/recordings/conversations/demo-ava-agent-001/summaries?connectionId=mock')).status).toBe(401);
     expect((await request('/api/recordings/conversations/demo-ava-agent-001/transcription?connectionId=mock')).status).toBe(401);
     const badLogin = await request('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'integration-admin', password: 'wrong password' }) });
@@ -131,6 +132,9 @@ describe('HTTP API security and Mock Mode flows', () => {
     const schedules=await request('/api/library/schedules');
     expect(schedules.status).toBe(200);
     expect(await schedules.json()).toMatchObject({schedules:[]});
+    const workerStatus=await request('/api/library/worker-status');
+    expect(workerStatus.status).toBe(200);
+    expect(await workerStatus.json()).toMatchObject({state:'idle',schedules:[]});
     const archivedLibrary=await request('/api/library');
     expect(archivedLibrary.status).toBe(200);
     expect(await archivedLibrary.json()).toMatchObject({items:[],total:0,page:1,pageSize:25});
@@ -160,6 +164,9 @@ describe('HTTP API security and Mock Mode flows', () => {
     const verifyDb=new Database(integrationDatabasePath,{readonly:true});
     expect(verifyDb.prepare('SELECT enabled,run_requested,run_status FROM library_schedules WHERE id=?').get(scheduleId)).toMatchObject({enabled:0,run_requested:0,run_status:'failed'});
     verifyDb.close();
+    const workerAfterRun=await (await request('/api/library/worker-status')).json() as {state:string;schedules:{id:string;run_status:string;enabled:number;failed_count:number}[]};
+    expect(workerAfterRun.state).toBe('failed');
+    expect(workerAfterRun.schedules.find(schedule=>schedule.id===scheduleId)).toMatchObject({run_status:'failed',enabled:0,failed_count:0});
 
     const noCsrf = await request('/api/recordings/search', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     expect(noCsrf.status).toBe(403);

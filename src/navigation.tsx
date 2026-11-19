@@ -5,7 +5,7 @@ import type { User } from './types';
 export const navGroups=[
   {title:'Overview',items:[['Dashboard','/dashboard',LayoutDashboard],['Recording Search','/search',Search]]},
   {title:'Workspace',items:[['Playback History','/history',History],['Audit Logs','/audit',ShieldCheck]]},
-  {title:'Sound Library',items:[['Library','/library',Archive],['Schedule Archive','/library/schedules',History],['Library Setting','/library/settings',Settings]]},
+  {title:'Sound Library',items:[['Library','/library',Archive],['Schedule Archive','/library/schedules',History],['Worker Status','/library/worker',Activity],['Library Setting','/library/settings',Settings]]},
   {title:'Administration',items:[['Genesys Configuration','/connections',Activity],['Genesys Regions','/regions',Globe2],['Users & Access','/access',Users],['Settings','/settings',Settings]]},
 ] as const;
 
@@ -13,7 +13,7 @@ export function NavigationSidebar({mobile,path,user,autoCollapseSubmenu,onNaviga
   const [openGroup,setOpenGroup]=useState('');
   return <aside className={`sidebar ${mobile?'sidebar-open':''}`}>
     {navGroups.map(group=>{
-      const visibleItems=group.items.filter(([label])=>(label!=='Genesys Regions'&&label!=='Schedule Archive'&&label!=='Library Setting')||user.role==='administrator');
+      const visibleItems=group.items.filter(([label])=>(label!=='Genesys Regions'&&label!=='Schedule Archive'&&label!=='Worker Status'&&label!=='Library Setting')||user.role==='administrator');
       const expanded=!autoCollapseSubmenu||openGroup===group.title;
       return <div className="nav-group" key={group.title}>
         <button className="nav-group-toggle" aria-expanded={expanded} onClick={()=>autoCollapseSubmenu&&setOpenGroup(openGroup===group.title?'':group.title)}>

@@ -58,6 +58,9 @@ export function participantLines(participants: any[], userNames: Record<string, 
       displayName = `${participantPhone(participant, 'ani')} -> ${participantPhone(participant, 'dnis')}`;
     } else if (normalized === 'agent') {
       displayName = readableName(userNames[userId]) || participantName || 'Agent';
+    } else if (normalized === 'user') {
+      const participantId=typeof participant?.participantId==='string'?participant.participantId:'';
+      displayName=readableName(userNames[participantId])||participantName||'User';
     } else if (normalized === 'botflow' || normalized === 'ivr' || normalized === 'flow') {
       displayName = participantFlowName(participant) || participantName || 'Flow unavailable';
     }

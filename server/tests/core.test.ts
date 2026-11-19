@@ -5,7 +5,7 @@ import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
 import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
 import { queryAllConversations, VOICE_RECORDING_FILTERS } from '../conversation-query.js';
-import { participantLines, summarizeConversation } from '../conversation-summary.js';
+import { participantLines, summarizeConversation, withParticipantLines } from '../conversation-summary.js';
 import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceInteraction, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaRequestPath, recordingMetadataRequestPath, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
 import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
@@ -16,6 +16,7 @@ import { parseSmtpSettings, publicSmtpSettings } from '../mailer.js';
 import { DEFAULT_RECORDING_OUTPUT_FORMAT, ffmpegArguments, parseRecordingOutputFormat, preferredGenesysInputFormat, recordingOutputInfo, transcodeRecordingAudio, RECORDING_OUTPUT_FORMATS } from '../audio-transcode.js';
 import { execFileSync } from 'node:child_process';
 import { libraryTabFromPath, pathForLibraryTab } from '../../src/library-navigation.js';
+import { mapParticipantUserNames, participantUserLookupId } from '../participant-users.js';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
@@ -24,9 +25,11 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   it('maps Sound Library routes and tabs in both directions',()=>{
     expect(libraryTabFromPath('/library')).toBe('library');
     expect(libraryTabFromPath('/library/schedules')).toBe('schedules');
+    expect(libraryTabFromPath('/library/worker')).toBe('worker');
     expect(libraryTabFromPath('/library/settings')).toBe('settings');
     expect(pathForLibraryTab('library')).toBe('/library');
     expect(pathForLibraryTab('schedules')).toBe('/library/schedules');
+    expect(pathForLibraryTab('worker')).toBe('/library/worker');
     expect(pathForLibraryTab('settings')).toBe('/library/settings');
   });
 
@@ -121,6 +124,21 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
       'ACD : MFEC_Insure_CSR',
       'Agent : Suwajchai Rasikawan',
     ]);
+  });
+
+  it('resolves user-purpose participants by participantId like Genesys agents',async()=>{
+    const queried:string[]=[];
+    const conversation={participants:[
+      {purpose:'user',participantId:'genesys-user-id',participantName:'genesys-user-id'},
+      {purpose:'agent',participantId:'agent-participant-id',userId:'genesys-agent-id',participantName:'genesys-agent-id'},
+      {purpose:'customer',participantId:'customer-id',participantName:'Customer'},
+    ]};
+    const named=await mapParticipantUserNames({async get<T>(url:string):Promise<T>{queried.push(url);const id=decodeURIComponent(url.split('/').pop()||'');return ({name:id==='genesys-user-id'?'User Name':'Agent Name'} as T);}},conversation);
+    expect(queried.sort()).toEqual(['/api/v2/users/genesys-agent-id','/api/v2/users/genesys-user-id'].sort());
+    expect(named.participants.map((participant:any)=>participant.participantName)).toEqual(['User Name','Agent Name','Customer']);
+    expect(withParticipantLines(named).participants.map((participant:any)=>participant.displayText)).toEqual(['User : User Name','Agent : Agent Name','Customer : — -> —']);
+    expect(participantUserLookupId({purpose:'user',participantId:'user-p-1'})).toBe('user-p-1');
+    expect(participantUserLookupId({purpose:'customer',participantId:'customer-p-1'})).toBe('');
   });
 
   it('recognizes Genesys audio recordings when their mediaType is missing or callback', () => {
