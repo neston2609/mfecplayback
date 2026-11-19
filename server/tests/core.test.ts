@@ -336,6 +336,17 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(attempts).toBe(8);
   });
 
+  it('accepts Genesys signed media returned under an opaque single format key when a format was requested', async () => {
+    const requested:string[]=[];
+    const signedMediaUri='https://api-downloads.apse1.pure.cloud/download?expires=123&signature=opaque&token=media';
+    const client={async get<T>(endpoint:string):Promise<T>{requested.push(endpoint);return {id:'recording',fileState:'AVAILABLE',mediaUris:{S:{mediaUri:signedMediaUri}}} as T;}};
+    await expect(getRecordingMedia(client,'conversation','recording',async()=>undefined,'WEBM',[],false)).resolves.toBeUndefined();
+    requested.length=0;
+    const playable=await getRecordingMedia(client,'conversation','recording',async()=>undefined,'WEBM',[],true);
+    expect(playable).toMatchObject({mediaUri:signedMediaUri,metadata:{id:'recording',fileState:'AVAILABLE'}});
+    expect(requested).toEqual(['/api/v2/conversations/conversation/recordings/recording?formatId=WEBM&download=true']);
+  });
+
   it('converts recordings to the configured audio-only format with bounded input and output', async () => {
     expect(DEFAULT_RECORDING_OUTPUT_FORMAT).toBe('m4a');
     expect(preferredGenesysInputFormat('m4a')).toBe('WEBM');

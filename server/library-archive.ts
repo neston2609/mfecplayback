@@ -10,10 +10,10 @@ import { getRecordingMedia, isMessageRecording, isVoiceRecording, isZipMediaCont
 import { summarizeConversation } from './conversation-summary.js';
 import { extractSingleAudioFromZip } from './zip-audio.js';
 import { initialArchiveCursor, nextScheduleTime } from './library-schedule.js';
-import { VOICE_RECORDING_FILTERS } from './conversation-query.js';
+import { MAX_ANALYTICS_CONVERSATIONS, queryAllConversations, VOICE_RECORDING_FILTERS } from './conversation-query.js';
 import { DEFAULT_RECORDING_OUTPUT_FORMAT, genesysMediaFormatKey, parseRecordingOutputFormat, preferredGenesysInputFormat, transcodeRecordingAudio, type RecordingOutputFormat } from './audio-transcode.js';
 
-const DAY=86400000, PAGE_SIZE=100, MAX_PAGES_PER_WINDOW=100, WINDOWS_PER_TICK=2, ITEMS_PER_TICK=5;
+const DAY=86400000, WINDOWS_PER_TICK=2, ITEMS_PER_TICK=5;
 type Schedule={id:string;name:string;connection_id:string;destination_id:string;cadence:'daily'|'weekly'|'monthly';day_of_week:number|null;day_of_month:number|null;run_time:string;time_zone:string;enabled:number;cursor_at:string;backfill_complete:number;next_run_at:string;run_status:string;last_started_at:string|null;run_requested?:number};
 type QueueItem={id:number;schedule_id:string;conversation_id:string;conversation_start:string;attempts:number};
 type ArchiveDeps={clientFor?:(connection:Connection)=>GenesysClient;writeFile?:typeof writeDestinationFile;now?:()=>Date;fetchMedia?:typeof fetch;outputFormat?:()=>RecordingOutputFormat;transcode?:typeof transcodeRecordingAudio};
@@ -35,12 +35,12 @@ function extensionFor(mimeType:string, metadata:any) {
 async function getMediaBytes(client:GenesysClient,connection:Connection,conversationId:string,recordingId:string,fetchMedia:typeof fetch,inputFormat='WEBM') {
   const fallbackFormats=['WEBM','MP3','WAV','WAV_ULAW','OGG_OPUS','OGG_VORBIS','M4A','MP4'];
   let playable;
-  try{playable=await getRecordingMedia(client,conversationId,recordingId,undefined,inputFormat,fallbackFormats,false);}
+  try{playable=await getRecordingMedia(client,conversationId,recordingId,undefined,inputFormat,fallbackFormats,true);}
   catch(error){
     if(!(error instanceof GenesysError&&[400,404].includes(error.status)))throw error;
     const fallbacks=fallbackFormats.filter(format=>genesysMediaFormatKey(format)!==genesysMediaFormatKey(inputFormat));
     for(const format of fallbacks){
-      try{playable=await getRecordingMedia(client,conversationId,recordingId,undefined,format,fallbackFormats,false);if(playable)break;}
+      try{playable=await getRecordingMedia(client,conversationId,recordingId,undefined,format,fallbackFormats,true);if(playable)break;}
       catch(fallbackError){if(!(fallbackError instanceof GenesysError&&[400,404].includes(fallbackError.status)))throw fallbackError;}
     }
     if(!playable)throw error;
@@ -129,14 +129,10 @@ export class LibraryArchiveWorker {
   }
   private async enqueueWindow(client:GenesysClient,schedule:Schedule,start:number,end:number,now:Date){
     const interval=`${new Date(start).toISOString()}/${new Date(end).toISOString()}`;
-    for(let page=1;page<=MAX_PAGES_PER_WINDOW;page++){
-      const result=await client.post<{conversations?:any[];totalHits?:number;totalCount?:number}>('/api/v2/analytics/conversations/details/query',{interval,paging:{pageSize:PAGE_SIZE,pageNumber:page},order:'asc',orderBy:'conversationStart',...VOICE_RECORDING_FILTERS});
-      const conversations=Array.isArray(result?.conversations)?result.conversations:[];
-      const insert=db.prepare("INSERT INTO library_archive_queue(schedule_id,conversation_id,conversation_start,status,created_at) VALUES(?,?,?,'pending',?) ON CONFLICT(schedule_id,conversation_id) DO NOTHING");
-      const transaction=db.transaction(()=>{for(const conversation of conversations){if(!conversation?.conversationId)continue;const conversationStart=Date.parse(conversation.conversationStart);if(Number.isFinite(conversationStart)&&conversationStart>=start&&conversationStart<end)insert.run(schedule.id,String(conversation.conversationId).slice(0,128),new Date(conversationStart).toISOString(),now.toISOString());}});transaction();
-      const total=result?.totalHits??result?.totalCount;if(!conversations.length||conversations.length<PAGE_SIZE||(Number.isFinite(total)&&page*PAGE_SIZE>=Number(total)))break;
-      if(page===MAX_PAGES_PER_WINDOW)throw new Error(`Genesys returned more than ${PAGE_SIZE*MAX_PAGES_PER_WINDOW} conversations in one day. Reduce archive search density or use a separate connection; the cursor remains unchanged.`);
-    }
+    const {conversations,partial}=await queryAllConversations(client,interval,VOICE_RECORDING_FILTERS,MAX_ANALYTICS_CONVERSATIONS);
+    if(partial)throw new Error(`Genesys returned more than ${MAX_ANALYTICS_CONVERSATIONS} conversations in one archive window. Reduce archive search density or use a separate connection; the cursor remains unchanged.`);
+    const insert=db.prepare("INSERT INTO library_archive_queue(schedule_id,conversation_id,conversation_start,status,created_at) VALUES(?,?,?,'pending',?) ON CONFLICT(schedule_id,conversation_id) DO NOTHING");
+    const transaction=db.transaction(()=>{for(const conversation of conversations){if(!conversation?.conversationId)continue;const conversationStart=Date.parse(conversation.conversationStart);if(Number.isFinite(conversationStart)&&conversationStart>=start&&conversationStart<end)insert.run(schedule.id,String(conversation.conversationId).slice(0,128),new Date(conversationStart).toISOString(),now.toISOString());}});transaction();
   }
   private clientFor(connectionId:string){const row=db.prepare('SELECT * FROM connections WHERE id=? AND enabled=1').get(connectionId) as Connection|undefined;if(!row)throw new Error('The scheduled Genesys connection is unavailable or disabled.');const user=db.prepare("SELECT id,role FROM users WHERE enabled=1 AND role='administrator' ORDER BY created_at LIMIT 1").get() as {id:string;role:string}|undefined;if(!user)throw new Error('No enabled administrator is available to authorize the archive connection.');const connection=connectionById(row.id,user.id,user.role);return this.deps.clientFor?.(connection)||new GenesysClient(connection);}
   private async archiveConversation(schedule:Schedule,item:QueueItem){
