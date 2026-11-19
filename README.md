@@ -109,11 +109,13 @@ For example, from `1.8.6` these produce `2.0.0`, `1.9.0`, and `1.8.7`. Commit th
 
 ## Deployment (Ubuntu, no Docker required)
 
-1. Install Node.js 20+, create a dedicated `recording-explorer` service user, and deploy source to `/opt/mfec-recording-explorer`.
+1. Install Node.js 20+ and FFmpeg (`sudo apt-get update && sudo apt-get install -y ffmpeg`), create a dedicated `recording-explorer` service user, and deploy source to `/opt/mfec-recording-explorer`. FFmpeg must be available to the service account; set `FFMPEG_PATH` in the environment file if the binary is installed at a non-standard path.
 2. Run `npm ci`, configure `/etc/mfec-recording-explorer.env` with secrets and a runtime directory under `/var/lib/mfec-recording-explorer`, and ensure only the service user can read it (`root:recording-explorer`, mode `0640`; this is required because the app runs as the service group).
 3. Set `NODE_ENV=production`, strong unique `SESSION_SECRET` (48+ characters), `MASTER_ENCRYPTION_KEY`, the public HTTPS `APP_ORIGIN`, `TRUST_PROXY=true` (only behind the one trusted Nginx proxy), `MOCK_MODE=false`, and a strong one-time initial admin password. Do not use example values. Startup rejects insecure/missing production configuration.
 4. Run `npm run db:migrate`, `npm run build`, then start with the systemd unit below.
 5. Terminate TLS at Nginx. Keep the Node listener loopback-only, use HTTPS/HSTS, restrict administrative access, firewall only required ports, and protect backups.
+
+Library Settings lets an administrator choose the output format used for direct recording downloads and new Scheduled Archive recordings: M4A/AAC (default), audio-only MP4/AAC, MP3, WAV/PCM, WebM/Opus, OGG/Opus, OGG/Vorbis, or WAV/μ-law. FFmpeg performs the conversion; existing archived audio is not rewritten when this setting changes.
 
 Example systemd unit (`/etc/systemd/system/mfec-recording-explorer.service`):
 

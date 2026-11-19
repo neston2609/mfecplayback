@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,6 +13,7 @@ let baseUrl = '';
 let cookie = '';
 let csrf = '';
 let serverOutput = '';
+let ffmpegFixture = '';
 
 async function freePort() {
   const socket = net.createServer();
@@ -48,6 +49,10 @@ async function request(route: string, init: RequestInit = {}, useCsrf = false) {
 describe('HTTP API security and Mock Mode flows', () => {
   beforeAll(async () => {
     testDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'mfec-recording-explorer-test-'));
+    if (process.env.FFMPEG_PATH) {
+      ffmpegFixture = path.join(testDirectory, 'fixture.wav');
+      execFileSync(process.env.FFMPEG_PATH, ['-hide_banner','-loglevel','error','-f','lavfi','-i','sine=frequency=440:duration=0.25','-c:a','pcm_s16le','-ar','8000','-ac','1','-y',ffmpegFixture]);
+    }
     const port = await freePort();
     baseUrl = `http://127.0.0.1:${port}`;
     child = spawn(process.execPath, ['--import', 'tsx', 'server/index.ts'], {
@@ -57,6 +62,7 @@ describe('HTTP API security and Mock Mode flows', () => {
         NODE_ENV: 'test', PORT: String(port), HOST: '127.0.0.1',
         APP_ORIGIN: 'http://localhost:5173', TRUST_PROXY: 'false', MOCK_MODE: 'true',
         SESSION_SECRET: 'integration-test-session-secret-with-sufficient-entropy',
+        ...(process.env.FFMPEG_PATH ? { FFMPEG_PATH: process.env.FFMPEG_PATH } : {}),
         MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 17).toString('base64'),
         DATABASE_PATH: path.join(testDirectory, 'integration.sqlite'),
         LIBRARY_STORAGE_ROOT: path.join(testDirectory,'library-storage'),
@@ -102,7 +108,25 @@ describe('HTTP API security and Mock Mode flows', () => {
 
     const destinations=await request('/api/library/destinations');
     expect(destinations.status).toBe(200);
-    expect(await destinations.json()).toMatchObject({destinations:[]});
+    expect(await destinations.json()).toMatchObject({destinations:[],recordingOutputFormat:'m4a'});
+    const recordingFormat=await request('/api/library/recording-format');
+    expect(recordingFormat.status).toBe(200);
+    const recordingFormatInfo=await recordingFormat.json() as {format:string;formats:string[];conversionAvailable:boolean};
+    expect(recordingFormatInfo).toMatchObject({format:'m4a'});
+    expect(recordingFormatInfo.formats).toEqual(['m4a','mp4','mp3','wav','webm','ogg_opus','ogg_vorbis','wav_ulaw']);
+    expect((await request('/api/library/recording-format',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({format:'mp3'})})).status).toBe(403);
+    const updateFormat=await request('/api/library/recording-format',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({format:'mp3'})},true);
+    expect(updateFormat.status).toBe(recordingFormatInfo.conversionAvailable?200:503);
+    if(recordingFormatInfo.conversionAvailable){expect(await updateFormat.json()).toMatchObject({format:'mp3',extension:'mp3',mimeType:'audio/mpeg'});expect(await (await request('/api/library/recording-format')).json()).toMatchObject({format:'mp3'});}
+    if(ffmpegFixture&&recordingFormatInfo.conversionAvailable){
+      const {transcodeRecordingAudio}=await import('../audio-transcode.js');
+      const converted=await transcodeRecordingAudio(await fs.readFile(ffmpegFixture),'mp3');
+      const output=path.join(testDirectory,`converted.${converted.extension}`);
+      await fs.writeFile(output,converted.bytes);
+      expect(()=>execFileSync(process.env.FFMPEG_PATH!,['-hide_banner','-loglevel','error','-i',output,'-f','null','-'],{stdio:'ignore'})).not.toThrow();
+      expect(converted.mimeType).toBe('audio/mpeg');
+      expect(converted.bytes.length).toBeGreaterThan(0);
+    }
     const schedules=await request('/api/library/schedules');
     expect(schedules.status).toBe(200);
     expect(await schedules.json()).toMatchObject({schedules:[]});

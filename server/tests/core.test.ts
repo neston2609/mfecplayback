@@ -13,6 +13,8 @@ import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from
 import { aiConversationSummaryPath, analyticsConversationDetailsPath, avaConversationSummaryPath, fetchConversationSummaryArtifacts, transcriptSearchCommunicationIds, transcriptSearchPath, transcriptSearchRequest } from '../conversation-artifacts.js';
 import { checkPasswordPolicy, isPasswordPolicySatisfied } from '../password-policy.js';
 import { parseSmtpSettings, publicSmtpSettings } from '../mailer.js';
+import { DEFAULT_RECORDING_OUTPUT_FORMAT, ffmpegArguments, parseRecordingOutputFormat, preferredGenesysInputFormat, recordingOutputInfo, transcodeRecordingAudio, RECORDING_OUTPUT_FORMATS } from '../audio-transcode.js';
+import { execFileSync } from 'node:child_process';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
@@ -256,18 +258,58 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     const client = { async get<T>(endpoint: string): Promise<T> {
       requested.push(endpoint);
       if (endpoint.endsWith('/recordings')) return [] as T;
-      return (requested.filter(item => item.includes('/recordings/recording?')).length < 3 ? undefined : { mediaUris: { S: { mediaUri: 'https://prod-recording-playback.s3.amazonaws.com/audio?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig' } } }) as T;
+      return (requested.filter(item => item.includes('/recordings/recording?')).length < 3 ? undefined : { mediaUris: { WEBM: { mediaUri: 'https://prod-recording-playback.s3.amazonaws.com/audio?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig' } } }) as T;
     } };
     const result = await getRecordingMedia(client, 'conversation', 'recording', async () => undefined);
     expect(requested).toHaveLength(4);
     expect(requested[1]).toBe('/api/v2/conversations/conversation/recordings');
     expect(requested.filter(endpoint => endpoint.includes('/recordings/recording?')).every(endpoint => endpoint.includes('formatId=WEBM'))).toBe(true);
     expect(result?.mediaUri).toContain('X-Amz-Signature=sig');
+    const explicitFormat = await getRecordingMedia({ async get<T>(endpoint:string):Promise<T>{return ({mediaUris:{WEBM:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/webm?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'},MP3:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/mp3?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'}}} as T);}},'conversation','recording',undefined,'MP3');
+    expect(explicitFormat?.mediaUri).toContain('/mp3?');
+    const strict = await getRecordingMedia({ async get<T>(endpoint:string):Promise<T>{return (endpoint.endsWith('/recordings') ? [{id:'strict-recording',mediaUris:{WEBM:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/webm?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'},MP3:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/mp3?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'}}}] : {mediaUris:{}}) as T;}},'conversation','strict-recording',async()=>undefined,'MP3');
+    expect(strict?.mediaUri).toContain('/mp3?');
+    const mismatch = await getRecordingMedia({ async get<T>(endpoint:string):Promise<T>{return (endpoint.endsWith('/recordings') ? [{id:'strict-recording',mediaUris:{WEBM:{mediaUri:'https://prod-recording-playback.s3.amazonaws.com/webm?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'}}}] : {mediaUris:{}}) as T;}},'conversation','strict-recording',async()=>undefined,'MP3');
+    expect(mismatch).toBeUndefined();
+    const formatless = await getRecordingMedia({ async get<T>(endpoint:string):Promise<T>{return (endpoint.endsWith('/recordings') ? [{id:'strict-recording',mediaUri:'https://prod-recording-playback.s3.amazonaws.com/unknown?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600&X-Amz-Signature=sig'}] : {mediaUris:{}}) as T;}},'conversation','strict-recording',async()=>undefined,'MP3');
+    expect(formatless).toBeUndefined();
     let attempts = 0;
     const unavailableClient = { async get<T>(): Promise<T> { attempts++; return undefined as T; } };
     expect(await getRecordingMedia(unavailableClient, 'conversation', 'pending', async () => undefined)).toBeUndefined();
     expect(attempts).toBe(8);
   });
+
+  it('converts recordings to the configured audio-only format with bounded input and output', async () => {
+    expect(DEFAULT_RECORDING_OUTPUT_FORMAT).toBe('m4a');
+    expect(preferredGenesysInputFormat('m4a')).toBe('WEBM');
+    expect(preferredGenesysInputFormat('mp3')).toBe('MP3');
+    expect(recordingOutputInfo('m4a')).toEqual({extension:'m4a',mimeType:'audio/mp4'});
+    expect(ffmpegArguments('mp4')).toContain('pipe:0');
+    expect(ffmpegArguments('mp4')).toContain('-vn');
+    expect(ffmpegArguments('m4a')).toContain('aac');
+    expect(ffmpegArguments('mp3')).toContain('libmp3lame');
+    for(const format of RECORDING_OUTPUT_FORMATS)expect(ffmpegArguments(format)).toContain('-vn');
+    const input=Buffer.from('synthetic audio bytes');let invoked=false;
+    const output=await transcodeRecordingAudio(input,'m4a',async(bytes,args)=>{invoked=true;expect(bytes).toEqual(input);expect(args).toContain('-vn');return Buffer.from('converted m4a');});
+    expect(invoked).toBe(true);
+    expect(output).toMatchObject({bytes:Buffer.from('converted m4a'),format:'m4a',extension:'m4a',mimeType:'audio/mp4'});
+    await expect(transcodeRecordingAudio(input,'flac',async()=>Buffer.from('x'))).rejects.toThrow(/supported recording output format/i);
+    await expect(transcodeRecordingAudio(input,'mp3',async()=>Buffer.alloc(0))).rejects.toThrow(/empty/i);
+  });
+
+  it.skipIf(!process.env.FFMPEG_PATH)('transcodes real audio into every supported audio-only container', async () => {
+    const ffmpeg=process.env.FFMPEG_PATH!,ffprobe=ffmpeg.replace(/ffmpeg(?:\.exe)?$/i,match=>match.toLowerCase().endsWith('.exe')?'ffprobe.exe':'ffprobe');
+    const input=execFileSync(ffmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','sine=frequency=1000:duration=0.2','-c:a','pcm_s16le','-ar','8000','-ac','1','-f','wav','pipe:1'],{maxBuffer:1024*1024});
+    for(const format of RECORDING_OUTPUT_FORMATS){
+      const converted=await transcodeRecordingAudio(input,format);
+      const output=execFileSync(ffmpeg,['-hide_banner','-loglevel','error','-protocol_whitelist','pipe','-i','pipe:0','-c','copy','-f','matroska','pipe:1'],{input:converted.bytes,maxBuffer:4*1024*1024});
+      const probe=JSON.parse(execFileSync(ffprobe,['-v','error','-show_entries','stream=codec_type,codec_name:format=format_name','-of','json','-i','pipe:0'],{input:output,encoding:'utf8'}));
+      expect(probe.streams).toHaveLength(1);
+      expect(probe.streams[0].codec_type).toBe('audio');
+      expect(probe.streams[0].codec_name).toBe(format==='m4a'||format==='mp4'?'aac':format==='mp3'?'mp3':format==='webm'?'opus':format==='ogg_opus'?'opus':format==='ogg_vorbis'?'vorbis':format==='wav_ulaw'?'pcm_mulaw':'pcm_s16le');
+      expect(converted.bytes.length).toBeGreaterThan(0);
+    }
+  },60_000);
 
   it('uses the media URI from the matching recording list item when detail metadata has none', async () => {
     const requested: string[] = [];

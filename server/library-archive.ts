@@ -11,11 +11,12 @@ import { summarizeConversation } from './conversation-summary.js';
 import { extractSingleAudioFromZip } from './zip-audio.js';
 import { nextScheduleTime } from './library-schedule.js';
 import { VOICE_RECORDING_FILTERS } from './conversation-query.js';
+import { DEFAULT_RECORDING_OUTPUT_FORMAT, genesysMediaFormatKey, parseRecordingOutputFormat, preferredGenesysInputFormat, transcodeRecordingAudio, type RecordingOutputFormat } from './audio-transcode.js';
 
 const DAY=86400000, PAGE_SIZE=100, MAX_PAGES_PER_WINDOW=100, WINDOWS_PER_TICK=2, ITEMS_PER_TICK=5;
 type Schedule={id:string;name:string;connection_id:string;destination_id:string;cadence:'daily'|'weekly'|'monthly';day_of_week:number|null;day_of_month:number|null;run_time:string;time_zone:string;enabled:number;cursor_at:string;backfill_complete:number;next_run_at:string;run_status:string;last_started_at:string|null};
 type QueueItem={id:number;schedule_id:string;conversation_id:string;conversation_start:string;attempts:number};
-type ArchiveDeps={clientFor?:(connection:Connection)=>GenesysClient;writeFile?:typeof writeDestinationFile;now?:()=>Date;fetchMedia?:typeof fetch};
+type ArchiveDeps={clientFor?:(connection:Connection)=>GenesysClient;writeFile?:typeof writeDestinationFile;now?:()=>Date;fetchMedia?:typeof fetch;outputFormat?:()=>RecordingOutputFormat;transcode?:typeof transcodeRecordingAudio};
 
 export { nextScheduleTime } from './library-schedule.js';
 
@@ -31,8 +32,10 @@ function extensionFor(mimeType:string, metadata:any) {
   if(mimeType.includes('wav'))return 'wav';if(mimeType.includes('mpeg'))return 'mp3';if(mimeType.includes('ogg'))return 'ogg';if(mimeType.includes('mp4'))return 'm4a';if(mimeType.includes('webm'))return 'webm';return 'audio';
 }
 
-async function getMediaBytes(client:GenesysClient,connection:Connection,conversationId:string,recordingId:string,fetchMedia:typeof fetch) {
-  const playable=await getRecordingMedia(client,conversationId,recordingId);if(!playable)return undefined;
+async function getMediaBytes(client:GenesysClient,connection:Connection,conversationId:string,recordingId:string,fetchMedia:typeof fetch,inputFormat='WEBM') {
+  const playable=await getRecordingMedia(client,conversationId,recordingId,undefined,inputFormat);if(!playable)return undefined;
+  const mediaUris=playable.metadata?.mediaUris;
+  if(mediaUris&&typeof mediaUris==='object'&&!Array.isArray(mediaUris)&&!Object.keys(mediaUris).some(key=>genesysMediaFormatKey(key)===genesysMediaFormatKey(inputFormat)))return undefined;
   let voiceContext:any;
   if(!(typeof playable.metadata?.mediaType==='string'&&playable.metadata.mediaType.toLowerCase()==='voice'))voiceContext=await client.get<any>(`/api/v2/analytics/conversations/${encodeURIComponent(conversationId)}/details`);
   if(!isVoiceRecording(playable.metadata,voiceContext)||isMessageRecording(playable.metadata))return undefined;
@@ -43,10 +46,10 @@ async function getMediaBytes(client:GenesysClient,connection:Connection,conversa
     const location=response.headers.get('location');if(!location||redirects===2)throw new Error('Genesys recording media returned an invalid redirect.');url=validateRecordingMediaUrl(new URL(location,url).toString(),connection);
   }
   if(!response||!response.ok){await response?.body?.cancel().catch(()=>{});throw new Error(`Genesys recording media request failed (HTTP ${response?.status||0}).`);}
-  if(Number(response.headers.get('content-length')||0)>128*1024*1024){await response.body?.cancel().catch(()=>{});throw new Error('Recording exceeds the 128 MB archive limit.');}
+  if(Number(response.headers.get('content-length')||0)>256*1024*1024){await response.body?.cancel().catch(()=>{});throw new Error('Recording exceeds the 256 MB archive limit.');}
   if(!response.body)throw new Error('Genesys returned an empty recording media response.');
   const reader=response.body.getReader(),chunks:Buffer[]=[];let size=0;
-  try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>128*1024*1024){await reader.cancel();throw new Error('Recording exceeds the 128 MB archive limit.');}chunks.push(Buffer.from(value));}}finally{reader.releaseLock();}
+  try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>256*1024*1024){await reader.cancel();throw new Error('Recording exceeds the 256 MB archive limit.');}chunks.push(Buffer.from(value));}}finally{reader.releaseLock();}
   const mimeType=(response.headers.get('content-type')||'application/octet-stream').split(';')[0].toLowerCase();let bytes=Buffer.concat(chunks,size);
   if(isZipMediaContentType(mimeType)){const extracted=extractSingleAudioFromZip(bytes);bytes=extracted.audio;return {bytes,mimeType:extracted.mimeType,extension:extracted.filename.split('.').pop()||'audio',metadata:playable.metadata};}
   if(!/^audio\//.test(mimeType)&&mimeType!=='application/octet-stream'&&!mimeType.startsWith('video/webm'))throw new Error('Genesys returned an unsupported recording media type.');
@@ -100,12 +103,13 @@ export class LibraryArchiveWorker {
       const valid=recordings.filter((recording:any)=>Boolean(recording?.id||recording?.recordingId));
       if(!valid.length)throw new Error('Genesys did not return any verified voice recording metadata for this recorded interaction; it will be retried.');
        const summary=summarizeConversation(conversation,{}),destination=db.prepare('SELECT * FROM library_destinations WHERE id=?').get(schedule.destination_id) as DestinationRow|undefined;if(!destination)throw new Error('The archive destination was deleted.');const config=decryptDestination(destination);let archived=0,alreadyArchived=0,mediaPending=false;
-       for(const recording of valid){const recordingId=String(recording.id||recording.recordingId);if(db.prepare('SELECT id FROM archived_recordings WHERE connection_id=? AND conversation_id=? AND recording_id=?').get(connection.id,item.conversation_id,recordingId)){alreadyArchived++;continue;}
-         let playable;try{playable=await getMediaBytes(client,connection,item.conversation_id,recordingId,this.deps.fetchMedia||fetch);}catch(error){if(error instanceof GenesysError&&error.status===429)throw error;if(String((recording as any)?.mediaType||'').toLowerCase()==='voice')throw error;continue;}if(!playable){if(String((recording as any)?.mediaType||'').toLowerCase()==='voice')mediaPending=true;continue;}
+        for(const recording of valid){const recordingId=String(recording.id||recording.recordingId);if(db.prepare('SELECT id FROM archived_recordings WHERE connection_id=? AND conversation_id=? AND recording_id=?').get(connection.id,item.conversation_id,recordingId)){alreadyArchived++;continue;}
+          const outputFormat=this.outputFormat();let playable;try{playable=await getMediaBytes(client,connection,item.conversation_id,recordingId,this.deps.fetchMedia||fetch,preferredGenesysInputFormat(outputFormat));}catch(error){if(error instanceof GenesysError&&error.status===429)throw error;if(String((recording as any)?.mediaType||'').toLowerCase()==='voice')throw error;continue;}if(!playable){if(String((recording as any)?.mediaType||'').toLowerCase()==='voice')mediaPending=true;continue;}
+         const source={mimeType:playable.mimeType,extension:playable.extension};const converted=await (this.deps.transcode||transcodeRecordingAudio)(playable.bytes,outputFormat),conversion={format:converted.format,sourceMimeType:source.mimeType,sourceExtension:source.extension};playable={...playable,bytes:converted.bytes,mimeType:converted.mimeType,extension:converted.extension};
         const date=summary.conversationStart.slice(0,10),folder=`${date}/${item.conversation_id}`,safeId=recordingId.replace(/[^a-zA-Z0-9_-]/g,'_'),fileName=`${safeId}.${playable.extension}`,relativePath=`${folder}/${fileName}`;
         const tempDir=await fs.mkdtemp(path.join(os.tmpdir(),'mfec-library-'));const audioPath=path.join(tempDir,fileName),metaPath=path.join(tempDir,`${fileName}.json`);
         try{
-          await fs.writeFile(audioPath,playable.bytes,{mode:0o600});const metadata={conversationId:item.conversation_id,connectionId:connection.id,recordingId,conversation:{...summary,conversationEnd:conversation.conversationEnd||'',agents:summary.agents,queues:summary.queues},recording:{...jsonSafe(recording),...jsonSafe(playable.metadata)},archivedAt:now};await fs.writeFile(metaPath,JSON.stringify(metadata,null,2),{mode:0o600});
+           await fs.writeFile(audioPath,playable.bytes,{mode:0o600});const metadata={conversationId:item.conversation_id,connectionId:connection.id,recordingId,conversation:{...summary,conversationEnd:conversation.conversationEnd||'',agents:summary.agents,queues:summary.queues},recording:{...jsonSafe(recording),...jsonSafe(playable.metadata)},conversion,archivedAt:now};await fs.writeFile(metaPath,JSON.stringify(metadata,null,2),{mode:0o600});
           await (this.deps.writeFile||writeDestinationFile)(config,relativePath,audioPath);await (this.deps.writeFile||writeDestinationFile)(config,`${relativePath}.json`,metaPath);
           const archiveId=crypto.randomUUID(),sha256=crypto.createHash('sha256').update(playable.bytes).digest('hex'),expiresAt=new Date(Date.parse(now)+config.retentionDays*DAY).toISOString();
           db.prepare('INSERT INTO archived_recordings(id,connection_id,conversation_id,recording_id,destination_id,relative_path,file_name,mime_type,size_bytes,sha256,conversation_start,conversation_end,direction,ani,dnis,agent_names,queues,duration_ms,metadata_json,archived_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(archiveId,connection.id,item.conversation_id,recordingId,destination.id,relativePath,fileName,playable.mimeType,playable.bytes.length,sha256,summary.conversationStart,conversation.conversationEnd||null,summary.direction||'',summary.ani||'',summary.dnis||'',JSON.stringify(summary.agents||[]),JSON.stringify(summary.queues||[]),Number(playable.metadata?.durationMs||recording.durationMs)||null,JSON.stringify(metadata),now,expiresAt);archived++;
@@ -117,6 +121,7 @@ export class LibraryArchiveWorker {
       const failed=Number((db.prepare("SELECT COUNT(*) AS n FROM library_archive_queue WHERE schedule_id=? AND status='failed'").get(schedule.id) as {n:number}).n);if(failed===0)db.prepare("UPDATE library_schedules SET last_error=NULL WHERE id=?").run(schedule.id);
     }catch(error){if(error instanceof GenesysError&&error.status===429)throw error;const attempts=item.attempts+1,status=attempts>=5?'failed':'pending';db.prepare('UPDATE library_archive_queue SET status=?,attempts=?,last_error=? WHERE id=?').run(status,attempts,safeError(error),item.id);db.prepare('UPDATE library_schedules SET last_error=?,run_status=?,updated_at=? WHERE id=?').run(safeError(error),status==='failed'?'failed':'queued',this.now().toISOString(),schedule.id);}
   }
+  private outputFormat(){const injected=this.deps.outputFormat?.();if(injected)return parseRecordingOutputFormat(injected);const row=db.prepare("SELECT value_json FROM application_settings WHERE key='recording_output_format'").get() as {value_json:string}|undefined;if(!row)return DEFAULT_RECORDING_OUTPUT_FORMAT;try{return parseRecordingOutputFormat(JSON.parse(row.value_json));}catch{return DEFAULT_RECORDING_OUTPUT_FORMAT;}}
   private connection(id:string){const row=db.prepare('SELECT * FROM connections WHERE id=? AND enabled=1').get(id) as Connection|undefined;if(!row)throw new Error('The scheduled Genesys connection is unavailable or disabled.');return row;}
   private async purgeExpired(){const rows=db.prepare('SELECT a.*,d.name AS name,d.type AS type,d.config_enc AS config_enc FROM archived_recordings a JOIN library_destinations d ON d.id=a.destination_id WHERE a.expires_at<? LIMIT 100').all(this.now().toISOString()) as (any&DestinationRow)[];for(const row of rows){try{const config=decryptDestination(row);await deleteDestinationFile(config,row.relative_path);await deleteDestinationFile(config,`${row.relative_path}.json`);db.prepare('DELETE FROM archived_recordings WHERE id=?').run(row.id);}catch{/* Keep the index row if storage deletion failed; retry on the next sweep. */}}}
 }

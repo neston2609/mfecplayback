@@ -1,9 +1,10 @@
 import type { Connection } from './genesys.js';
+import { genesysMediaFormatKey } from './audio-transcode.js';
 
 type RecordingMetadataClient = { get<T>(path: string): Promise<T> };
 
-export function recordingMediaRequestPath(conversationId: string, recordingId: string): string {
-  const query = new URLSearchParams({ formatId: 'WEBM', download: 'true' });
+export function recordingMediaRequestPath(conversationId: string, recordingId: string, formatId = 'WEBM'): string {
+  const query = new URLSearchParams({ formatId, download: 'true' });
   return `/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings/${encodeURIComponent(recordingId)}?${query}`;
 }
 
@@ -46,13 +47,44 @@ export async function listVoiceRecordings(client: RecordingMetadataClient, conve
   });
 }
 
-export function recordingMediaUri(metadata: any): string | undefined {
+export function recordingMediaUri(metadata: any, formatId?: string, strict = false, assumeRequestedFormat = false): string | undefined {
   const mediaUris = metadata?.mediaUris;
+  if (formatId && mediaUris && typeof mediaUris === 'object' && !Array.isArray(mediaUris)) {
+    const desired = genesysMediaFormatKey(formatId);
+    for (const [key, entry] of Object.entries(mediaUris) as [string, any][]) {
+      if (genesysMediaFormatKey(key) === desired && typeof entry?.mediaUri === 'string' && entry.mediaUri) return entry.mediaUri;
+    }
+    if (strict && assumeRequestedFormat) {
+      const entries = Object.values(mediaUris) as any[];
+      const available = entries.filter(entry => typeof entry?.mediaUri === 'string' && entry.mediaUri);
+      if (available.length === 1) return available[0].mediaUri;
+    }
+    if (strict && Object.keys(mediaUris).length && Object.values(mediaUris).some((entry: any) => typeof entry?.mediaUri === 'string' && entry.mediaUri)) return undefined;
+  }
   if (Array.isArray(mediaUris)) {
+    if (formatId) {
+      const desired = genesysMediaFormatKey(formatId);
+      for (const entry of mediaUris) {
+        const entryFormat = entry?.formatId || entry?.mediaFormat || entry?.format;
+        if (typeof entryFormat === 'string' && genesysMediaFormatKey(entryFormat) === desired && typeof entry?.mediaUri === 'string' && entry.mediaUri) return entry.mediaUri;
+      }
+      if (strict && assumeRequestedFormat) {
+        const available = mediaUris.filter((entry: any) => typeof entry?.mediaUri === 'string' && entry.mediaUri);
+        if (available.length === 1) return available[0].mediaUri;
+      }
+      if (strict) return undefined;
+    }
     for (const entry of mediaUris) if (typeof entry?.mediaUri === 'string' && entry.mediaUri) return entry.mediaUri;
   }
   if (mediaUris && typeof mediaUris === 'object') {
-    for (const entry of Object.values(mediaUris) as any[]) if (typeof entry?.mediaUri === 'string' && entry.mediaUri) return entry.mediaUri;
+    for (const [key, entry] of Object.entries(mediaUris) as [string, any][]) {
+      if (strict && genesysMediaFormatKey(key) !== genesysMediaFormatKey(formatId || '')) continue;
+      if (typeof entry?.mediaUri === 'string' && entry.mediaUri) return entry.mediaUri;
+    }
+  }
+  if (strict && formatId && metadata?.mediaUri) {
+    const mediaFormat = metadata?.mediaFormat || metadata?.formatId;
+    if (mediaFormat ? genesysMediaFormatKey(mediaFormat) !== genesysMediaFormatKey(formatId) : !assumeRequestedFormat) return undefined;
   }
   return typeof metadata?.mediaUri === 'string' && metadata.mediaUri ? metadata.mediaUri : undefined;
 }
@@ -94,15 +126,16 @@ export async function getRecordingMedia(
   client: RecordingMetadataClient,
   conversationId: string,
   recordingId: string,
-  wait: (milliseconds: number) => Promise<void> = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+  wait: ((milliseconds: number) => Promise<void>) | undefined = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+  formatId = 'WEBM',
 ) {
-  const path = recordingMediaRequestPath(conversationId, recordingId);
+  const path = recordingMediaRequestPath(conversationId, recordingId, formatId);
   const listPath = `/api/v2/conversations/${encodeURIComponent(conversationId)}/recordings`;
   const delays = [0, 750, 1500, 3000, 6000, 12000];
   for (let attempt = 0; attempt < delays.length; attempt++) {
-    if (attempt > 0) await wait(delays[attempt]);
+    if (attempt > 0) await (wait || (milliseconds => new Promise<void>(resolve => setTimeout(resolve, milliseconds))))(delays[attempt]);
     const metadata = await client.get<any>(path);
-    const mediaUri = recordingMediaUri(metadata);
+    const mediaUri = recordingMediaUri(metadata, formatId, true, true);
     if (mediaUri) return { metadata, mediaUri };
     // Genesys may return a media URI on the conversation recording list while
     // the individual recording download metadata omits it. Match the recording
@@ -112,7 +145,7 @@ export async function getRecordingMedia(
       const listed = Array.isArray(recordings)
         ? recordings.find((recording: any) => (recording?.id || recording?.recordingId) === recordingId)
         : undefined;
-      const listedMediaUri = recordingMediaUri(listed);
+      const listedMediaUri = recordingMediaUri(listed, formatId, true, false);
       if (listed && listedMediaUri) return { metadata: listed, mediaUri: listedMediaUri };
     }
   }
