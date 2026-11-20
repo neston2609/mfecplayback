@@ -596,9 +596,11 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   it('validates signed Genesys transcript URLs before fetching them server-side', () => {
     const connection={api_base_url:'https://api.apse1.pure.cloud'};
     const good='https://genesys-transcripts.s3.amazonaws.com/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600';
-    const regional='https://api-downloads.apse1.pure.cloud/transcriptsCache/example.json?Policy=policy&Signature=signature&Key-Pair-Id=key';
+    const regional='https://api-downloads.apse1.pure.cloud/transcriptsCache/example.json?Expires=1790000000&Signature=signature&Key-Pair-Id=key';
+    const regionalCustomPolicy='https://api-downloads.apse1.pure.cloud/transcriptsCache/example.json?Policy=policy&Signature=signature&Key-Pair-Id=key';
     expect(validateTranscriptUrl(good,connection).hostname).toBe('genesys-transcripts.s3.amazonaws.com');
     expect(validateTranscriptUrl(regional,connection).hostname).toBe('api-downloads.apse1.pure.cloud');
+    expect(validateTranscriptUrl(regionalCustomPolicy,connection).hostname).toBe('api-downloads.apse1.pure.cloud');
     expect(()=>validateTranscriptUrl('https://attacker.example/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600',connection)).toThrow(/untrusted/i);
     expect(()=>validateTranscriptUrl('https://api-downloads.mypurecloud.com/transcriptsCache/example.json?Policy=policy&Signature=signature&Key-Pair-Id=key',connection)).toThrow(/untrusted/i);
     expect(()=>validateTranscriptUrl('https://api-downloads.apse1.pure.cloud/other/example.json?Policy=policy&Signature=signature&Key-Pair-Id=key',connection)).toThrow(/untrusted/i);

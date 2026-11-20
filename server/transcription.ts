@@ -17,7 +17,7 @@ export function validateTranscriptUrl(value: string, connection: { api_base_url:
     (query.has('X-Amz-Signature') && query.has('X-Amz-Credential') && query.has('X-Amz-Date') && query.has('X-Amz-Expires')) ||
     (query.has('AWSAccessKeyId') && query.has('Signature') && query.has('Expires')),
   );
-  const signedRegionalDownload = query.has('Policy') && query.has('Signature') && query.has('Key-Pair-Id');
+  const signedRegionalDownload = (query.has('Policy') || query.has('Expires')) && query.has('Signature') && query.has('Key-Pair-Id');
   const regionalTranscriptCache = host === regionalDownloadHost && url.pathname.startsWith('/transcriptsCache/') && signedRegionalDownload;
   if (url.protocol !== 'https:' || url.username || url.password || url.port || !(regionalTranscriptCache || (trustedS3Host && signedS3))) {
     throw Object.assign(new Error('Genesys returned a transcript URL on an untrusted host.'), { status: 502 });
