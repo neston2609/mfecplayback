@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import { Activity, AlertCircle, ArrowDownToLine, ArrowLeft, ArrowRight, AudioLines, BarChart3, Bell, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clock3, Copy, Download, FileAudio, Filter, Globe2, Headphones, History, LayoutDashboard, LogOut, Menu, Moon, MoreHorizontal, Music2, Play, RefreshCw, Search, Settings, Shield, ShieldCheck, SlidersHorizontal, Sun, Users, Volume2, X } from 'lucide-react';
 import { localDateTimeToUtc } from './time';
+import { transcriptionErrorMessage } from './transcription-error';
 import { AccountAccessPage, AccountSettingsPage } from './account-pages';
 import { AppFooter, NavigationSidebar, navTitle } from './navigation';
 import { SoundLibraryPage } from './sound-library';
@@ -155,7 +156,7 @@ function ConversationDownloads({result,detail,connectionId}:{result:Result;detai
   const [transcriptionError,setTranscriptionError]=useState('');
   const [transcriptionBusy,setTranscriptionBusy]=useState(false);
   useEffect(()=>{if(connectionId==='mock')return;let active=true;api<{avaSummary:unknown;aiSummary:unknown}>(`/api/recordings/conversations/${encodeURIComponent(result.conversationId)}/summaries?connectionId=${encodeURIComponent(connectionId)}`).then(data=>{if(active)setSummaryData(data);}).catch(error=>{if(active)setSummaryError((error as Error).message);});return()=>{active=false;};},[connectionId,result.conversationId]);
-  async function downloadTranscription(){setTranscriptionBusy(true);setTranscriptionError('');try{const transcript=await api<unknown>(`/api/recordings/conversations/${encodeURIComponent(result.conversationId)}/transcription?connectionId=${encodeURIComponent(connectionId)}`);downloadJson(result.conversationId+'-transcription',transcript);}catch(error){setTranscriptionError((error as Error).message);}finally{setTranscriptionBusy(false);}}
+  async function downloadTranscription(){setTranscriptionBusy(true);setTranscriptionError('');try{const transcript=await api<unknown>(`/api/recordings/conversations/${encodeURIComponent(result.conversationId)}/transcription?connectionId=${encodeURIComponent(connectionId)}`);downloadJson(result.conversationId+'-transcription',transcript);}catch(error){setTranscriptionError(transcriptionErrorMessage(error));}finally{setTranscriptionBusy(false);}}
   const actualWrapUpCodes=(detail?.participants||[]).flatMap((participant:any)=>(participant.sessions||[]).flatMap((session:any)=>(session.segments||[]).filter((segment:any)=>segment.wrapUpCodeName||segment.wrapUpCode).map((segment:any)=>({agent:participant.participantName||participant.userId||participant.purpose,code:segment.wrapUpCodeName||(typeof segment.wrapUpCode==='string'&&!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(segment.wrapUpCode)?segment.wrapUpCode:'Wrap-up code unavailable'),segmentStart:segment.segmentStart||null,segmentEnd:segment.segmentEnd||null}))));
   const hasSummary=Boolean(summaryData&&(summaryData.avaSummary!==null||summaryData.aiSummary!==null));
   const exportSummary={conversationId:result.conversationId,generatedAt:new Date().toISOString(),avaSummary:summaryData?.avaSummary??null,aiSummary:summaryData?.aiSummary??null};

@@ -1,3 +1,5 @@
+import { GenesysError } from './genesys-client.js';
+
 export function transcriptionRequestPath(conversationId: string, communicationId: string): string {
   return `/api/v2/speechandtextanalytics/conversations/${encodeURIComponent(conversationId)}/communications/${encodeURIComponent(communicationId)}/transcripturl`;
 }
@@ -20,13 +22,13 @@ export function validateTranscriptUrl(value: string): URL {
 }
 
 export function normalizeTranscriptionError(error: unknown): unknown {
-  const status = (error as { status?: unknown } | null)?.status;
-  if (typeof status === 'number' && status >= 500 && status !== 501) {
+  if (error instanceof GenesysError && error.status >= 500 && error.status !== 501) {
     return Object.assign(
-      new Error(`Genesys transcription service returned an error (HTTP ${status}). Check Speech and Text Analytics access and Genesys service availability.`),
+      new Error(`Genesys transcription service returned an error (HTTP ${error.status}). Check Speech and Text Analytics access and Genesys service availability.`),
       { status: 502 },
     );
   }
+  const status = (error as { status?: unknown } | null)?.status;
   if (typeof status !== 'number' && error instanceof Error) {
     return Object.assign(
       new Error('Could not retrieve this transcription. Check that Speech and Text Analytics is enabled for the conversation and that the Genesys service account can access transcripts.'),

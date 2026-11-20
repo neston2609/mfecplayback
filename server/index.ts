@@ -647,7 +647,11 @@ app.get('/api/recordings/conversations/:conversationId/transcription', requireAu
     res.setHeader('Cache-Control','private, no-store, no-cache, must-revalidate');
     res.setHeader('X-Content-Type-Options','nosniff');
     res.json({conversationId,generatedAt:new Date().toISOString(),transcriptions:available});
-  } catch(error) { next(normalizeTranscriptionError(error)); }
+  } catch(error) {
+    const normalized=normalizeTranscriptionError(error),status=Number((normalized as {status?:unknown}|null)?.status)||500;
+    if(status>=500&&status!==501)console.error('Transcription request failed:',error);
+    next(normalized);
+  }
 });
 app.get('/api/recordings/:recordingId/stream', requireAuth, requireRealtimePlayback, async (req,res,next) => {
   let playbackConnection:Connection|undefined;

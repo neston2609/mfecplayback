@@ -6,7 +6,7 @@ import path from 'node:path';
 import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../regions.js';
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
-import { GenesysClient, verifyGenesysApiAccess } from '../genesys-client.js';
+import { GenesysClient, GenesysError, verifyGenesysApiAccess } from '../genesys-client.js';
 import { queryAllConversations, VOICE_RECORDING_FILTERS } from '../conversation-query.js';
 import { archivedConversationDisplay, collectQueueIds, conversationQueueNames, conversationWrapUpCodeNames, participantLines, summarizeConversation, withParticipantLines } from '../conversation-summary.js';
 import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceInteraction, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaRequestPath, recordingMetadataRequestPath, recordingMediaUriForFormats, validateRecordingMediaUrl } from '../recording-media.js';
@@ -603,7 +603,9 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   });
 
   it('returns a safe actionable gateway error for transcription service failures',()=>{
-    expect(normalizeTranscriptionError(Object.assign(new Error('Genesys API request failed'),{status:500}))).toMatchObject({status:502,message:expect.stringContaining('Speech and Text Analytics')});
+    expect(normalizeTranscriptionError(new GenesysError(503,'Genesys API could not be reached.'))).toMatchObject({status:502,message:expect.stringContaining('Speech and Text Analytics')});
+    const failedGenesysRequest=Object.assign(new Error('Genesys API request failed (HTTP 500).'),{status:500});
+    expect(normalizeTranscriptionError(failedGenesysRequest)).toBe(failedGenesysRequest);
     const unavailable=Object.assign(new Error('Transcription is not available.'),{status:404});
     expect(normalizeTranscriptionError(unavailable)).toBe(unavailable);
   });
