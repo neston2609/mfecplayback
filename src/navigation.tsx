@@ -11,9 +11,22 @@ export const navGroups=[
 
 export function NavigationSidebar({mobile,path,user,autoCollapseSubmenu,onNavigate}:{mobile:boolean;path:string;user:User;autoCollapseSubmenu:boolean;onNavigate:(to:string)=>void}){
   const [openGroup,setOpenGroup]=useState('');
+  const permissions=user.permissions;
+  const isAdmin=user.isAdministrator??user.role==='administrator';
+  const canRealtime=isAdmin||Boolean(permissions?.realtimePlayback);
+  const canLibrary=isAdmin||Boolean(permissions?.libraryPlayback||permissions?.libraryAdmin);
   return <aside className={`sidebar ${mobile?'sidebar-open':''}`}>
     {navGroups.map(group=>{
-      const visibleItems=group.items.filter(([label])=>(label!=='Genesys Regions'&&label!=='Schedule Archive'&&label!=='Worker Status'&&label!=='Library Setting')||user.role==='administrator');
+      const visibleItems=group.items.filter(([label,href])=>{
+        if(href==='/dashboard'&&!canRealtime)return false;
+        if(href==='/audit'&&!isAdmin)return false;
+        if(label==='Genesys Regions'&&!isAdmin)return false;
+        if((label==='Users & Access'||label==='Genesys Configuration')&&!isAdmin)return false;
+        if((label==='Schedule Archive'||label==='Worker Status'||label==='Library Setting')&&!isAdmin&&!permissions?.libraryAdmin)return false;
+        if(href==='/search'&&!canRealtime)return false;
+        if(href==='/library'&&!canLibrary)return false;
+        return true;
+      });
       const expanded=!autoCollapseSubmenu||openGroup===group.title;
       return <div className="nav-group" key={group.title}>
         <button className="nav-group-toggle" aria-expanded={expanded} onClick={()=>autoCollapseSubmenu&&setOpenGroup(openGroup===group.title?'':group.title)}>

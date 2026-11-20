@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import Database from 'better-sqlite3';
+import bcrypt from 'bcryptjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const root = process.cwd();
@@ -109,14 +110,19 @@ describe('HTTP API security and Mock Mode flows', () => {
     playbackDb.prepare('INSERT INTO audit_logs(user_id,username,action,result,created_at) VALUES(?,?,?,?,?)').run(adminId,'integration-admin','LIBRARY_PLAYBACK','SUCCESS',playedAt);
     playbackDb.prepare('INSERT INTO audit_logs(user_id,username,action,result,created_at) VALUES(?,?,?,?,?)').run(adminId,'integration-admin','LOGIN','SUCCESS',playedAt);
     playbackDb.prepare('INSERT INTO audit_logs(user_id,username,action,result,created_at) VALUES(?,?,?,?,?)').run('another-user-id','another-user','PLAYBACK','SUCCESS',playedAt);
+    const historyRow=playbackDb.prepare('INSERT INTO audit_logs(user_id,username,action,result,created_at) VALUES(?,?,?,?,?)');
+    for(let index=0;index<15;index++)historyRow.run(adminId,'integration-admin','PLAYBACK','SUCCESS',new Date(Date.parse(playedAt)+index+1).toISOString());
     playbackDb.close();
     expect((await request('/api/playback-history')).status).toBe(200);
-    const playbackHistory=await (await request('/api/playback-history')).json() as {items:{action:string;result:string;connectionId:string|null;conversationId:string|null;recordingId:string|null}[]};
-    expect(playbackHistory.items).toHaveLength(2);
-    expect(playbackHistory.items.map(item=>item.action)).toEqual(['LIBRARY_PLAYBACK','PLAYBACK']);
-    expect(playbackHistory.items.some(item=>item.connectionId==='another-user-id')).toBe(false);
-    expect(playbackHistory.items[1]).toMatchObject({result:'SUCCESS',connectionId:'history-connection',conversationId:'history-conversation',recordingId:'history-recording'});
-
+    const playbackHistory=await (await request('/api/playback-history')).json() as {items:{action:string;result:string;connectionId:string|null;conversationId:string|null;recordingId:string|null;playedBy:string;connectionName:string}[];total:number;page:number;pageSize:number;totalPages:number};
+    expect(playbackHistory).toMatchObject({total:18,page:1,pageSize:15,totalPages:2});
+    expect(playbackHistory.items).toHaveLength(15);
+    const playbackHistoryPageTwo=await (await request('/api/playback-history?page=2')).json() as typeof playbackHistory;
+    expect(playbackHistoryPageTwo.items.some(item=>item.playedBy==='another-user')).toBe(true);
+    expect(playbackHistoryPageTwo.items.find(item=>item.connectionId==='history-connection')).toMatchObject({result:'SUCCESS',connectionName:'history-connection',playedBy:'integration-admin',conversationId:'history-conversation',recordingId:'history-recording'});
+    expect(playbackHistoryPageTwo.items.find(item=>item.action==='LIBRARY_PLAYBACK')?.connectionName).toBe('—');
+    expect(playbackHistoryPageTwo).toMatchObject({total:18,page:2,pageSize:15,totalPages:2});
+    expect(playbackHistoryPageTwo.items).toHaveLength(3);
     const mockConnections = await request('/api/genesys/connections');
     expect(mockConnections.status).toBe(200);
     const listedConnections = await mockConnections.json() as { connections: { id: string; mock?: boolean }[] };
@@ -273,6 +279,17 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect((await byQueueName.json() as {results:{conversationId:string}[]}).results.map(row=>row.conversationId)).toEqual(['demo-ava-agent-001']);
     const byGroupName=await request('/api/recordings/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-11-14T00:00:00.000Z',intervalEnd:'2026-11-17T00:00:00.000Z',pageNumber:1,pageSize:25,groupName:'Customer Support'})},true);
     expect((await byGroupName.json() as {results:{conversationId:string}[]}).results.map(row=>row.conversationId)).toEqual(['demo-ava-agent-001']);
+    const phoneFormats=['0652936493','66652936493','+66652936493'];
+    const phoneSearches=await Promise.all(phoneFormats.map(phone=>request('/api/recordings/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-11-14T00:00:00.000Z',intervalEnd:'2026-11-17T00:00:00.000Z',pageNumber:1,pageSize:25,phone})},true)));
+    const phoneResultIds=await Promise.all(phoneSearches.map(async response=>{expect(response.status).toBe(200);return (await response.json() as {results:{conversationId:string}[]}).results.map(row=>row.conversationId);}));
+    expect(phoneResultIds[0]).toEqual(['demo-ava-agent-001']);
+    expect(phoneResultIds[1]).toEqual(phoneResultIds[0]);
+    expect(phoneResultIds[2]).toEqual(phoneResultIds[0]);
+    const dnisSearches=await Promise.all(['020000000','6620000000','+6620000000'].map(dnis=>request('/api/recordings/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-11-14T00:00:00.000Z',intervalEnd:'2026-11-17T00:00:00.000Z',pageNumber:1,pageSize:25,dnis})},true)));
+    const dnisResultIds=await Promise.all(dnisSearches.map(async response=>(await response.json() as {results:{conversationId:string}[]}).results.map(row=>row.conversationId)));
+    expect(dnisResultIds[0]).toEqual(['demo-bot-only-002','demo-ava-agent-001']);
+    expect(dnisResultIds[1]).toEqual(dnisResultIds[0]);
+    expect(dnisResultIds[2]).toEqual(dnisResultIds[0]);
 
     const conversationRecordings=await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock');
     expect(conversationRecordings.status).toBe(200);
@@ -304,7 +321,7 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(allConversations.results).toHaveLength(3);
     expect(allConversations.results.every(row => row.recordingCount > 0)).toBe(true);
     expect(allConversations.results.flatMap(row=>row.recordings).every(recording=>recording.mediaType==='voice')).toBe(true);
-  });
+  }, 30_000);
 
   it('lists saved live connections after trusted-region validation without exposing endpoint or secret fields', async () => {
     const liveDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'mfec-recording-explorer-live-test-'));
@@ -315,6 +332,10 @@ describe('HTTP API security and Mock Mode flows', () => {
     let liveCookie = '';
     let liveCsrf = '';
     try {
+      const legacyDatabase=new Database(path.join(liveDirectory,'integration.sqlite'));
+      legacyDatabase.exec("CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('administrator','supervisor','quality_analyst','viewer')), enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)");
+      legacyDatabase.prepare('INSERT INTO users(id,username,password_hash,role,enabled,created_at) VALUES(?,?,?,?,1,?)').run('legacy-admin-id','live-integration-admin',bcrypt.hashSync('Live-Integration-Password-456!',4),'administrator',new Date().toISOString());
+      legacyDatabase.close();
       liveChild = spawn(process.execPath, ['--import', 'tsx', 'server/index.ts'], {
         cwd: root,
         env: {
@@ -344,6 +365,14 @@ describe('HTTP API security and Mock Mode flows', () => {
       expect(login.status).toBe(200);
       liveCookie = (login.headers.get('set-cookie') || '').split(';', 1)[0];
       liveCsrf = (await login.json() as { csrfToken: string }).csrfToken;
+      const migratedDatabase=new Database(path.join(liveDirectory,'integration.sqlite'),{readonly:true});
+      const migratedUserColumns=(migratedDatabase.prepare('PRAGMA table_info(users)').all() as {name:string}[]).map(column=>column.name);
+      expect(migratedUserColumns).toContain('access_role_id');
+      expect(migratedUserColumns).toContain('department');
+      const legacyRoleConstraint=(migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get() as {sql:string}).sql;
+      expect(legacyRoleConstraint).toContain("CHECK(role IN ('administrator','supervisor','quality_analyst','viewer'))");
+      expect(migratedDatabase.prepare('SELECT access_role_id FROM users WHERE id=?').get('legacy-admin-id')).toEqual({access_role_id:'administrator'});
+      migratedDatabase.close();
 
     const create = await fetch(`${liveUrl}/api/genesys/connections`, {
         method: 'POST',
@@ -354,6 +383,22 @@ describe('HTTP API security and Mock Mode flows', () => {
         }),
       });
       expect(create.status).toBe(201);
+      const customRole=await fetch(`${liveUrl}/api/admin/roles`,{method:'POST',headers:{'content-type':'application/json',cookie:liveCookie,'x-csrf-token':liveCsrf,Origin:'http://localhost:5173'},body:JSON.stringify({name:'Library Operator',permissions:{libraryAdmin:true}})});
+      expect(customRole.status).toBe(201);
+      const customRoleBody=await customRole.json() as {role:{id:string}};
+      const customUser=await fetch(`${liveUrl}/api/admin/users`,{method:'POST',headers:{'content-type':'application/json',cookie:liveCookie,'x-csrf-token':liveCsrf,Origin:'http://localhost:5173'},body:JSON.stringify({username:'library-operator',password:'Library-Operator-Password-456!',role:customRoleBody.role.id,connectionIds:[]})});
+      expect(customUser.status).toBe(201);
+      const customLogin=await fetch(`${liveUrl}/api/auth/login`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'library-operator',password:'Library-Operator-Password-456!'})});
+      expect(customLogin.status).toBe(200);
+      const customCookie=(customLogin.headers.get('set-cookie')||'').split(';',1)[0];
+      const customConnections=await fetch(`${liveUrl}/api/genesys/connections`,{headers:{cookie:customCookie}});
+      expect((await customConnections.json() as {connections:{id:string}[]}).connections).toHaveLength(1);
+      const customScheduleList=await fetch(`${liveUrl}/api/library/schedules`,{headers:{cookie:customCookie}});
+      expect(customScheduleList.status).toBe(200);
+      const customRegions=await fetch(`${liveUrl}/api/genesys/regions`,{headers:{cookie:customCookie}});
+      expect(customRegions.status).toBe(403);
+      const customSearch=await fetch(`${liveUrl}/api/recordings/search`,{method:'POST',headers:{'content-type':'application/json',cookie:customCookie,Origin:'http://localhost:5173'},body:JSON.stringify({connectionId:'does-not-exist',intervalStart:'2026-10-01T00:00:00.000Z',intervalEnd:'2026-10-02T00:00:00.000Z'})});
+      expect(customSearch.status).toBe(403);
       const deniedLibraryConfiguration=await fetch(`${liveUrl}/api/library/destinations`,{method:'POST',headers:{'content-type':'application/json',cookie:liveCookie,Origin:'http://localhost:5173'},body:JSON.stringify({name:'Blocked local',type:'local',path:path.join(liveDirectory,'library'),retentionDays:30})});
       expect(deniedLibraryConfiguration.status).toBe(403);
 
@@ -514,6 +559,20 @@ describe('HTTP API security and Mock Mode flows', () => {
   });
 
   it('restricts administration, preserves a final administrator, and revokes disabled-user sessions', async () => {
+    const roleList=await request('/api/admin/roles');
+    expect(roleList.status).toBe(200);
+    const roleValues=await roleList.json() as {roles:{id:string;name:string;builtIn:boolean;permissions:{realtimePlayback:boolean;realtimeDownload:boolean;libraryPlayback:boolean;libraryAdmin:boolean}}[]};
+    expect(roleValues.roles.find(role=>role.id==='administrator')?.permissions).toEqual({realtimePlayback:true,realtimeDownload:true,libraryPlayback:true,libraryAdmin:true});
+    const noSearchRole=await request('/api/admin/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Archive Admin',permissions:{realtimePlayback:false,realtimeDownload:false,libraryPlayback:false,libraryAdmin:true}})},true);
+    expect(noSearchRole.status).toBe(201);
+    const archiveAdminRole=await noSearchRole.json() as {role:{id:string}};
+    const createRole=await request('/api/admin/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Archive Only',permissions:{realtimePlayback:false,realtimeDownload:false,libraryPlayback:true,libraryAdmin:false}})},true);
+    expect(createRole.status).toBe(201);
+    const archiveRole=await createRole.json() as {role:{id:string}};
+    const builtInRoleEdit=await request('/api/admin/roles/administrator',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Root',permissions:{}})},true);
+    expect(builtInRoleEdit.status).toBe(409);
+    const duplicateRole=await request('/api/admin/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Archive Only',permissions:{}})},true);
+    expect(duplicateRole.status).toBe(409);
     const currentUsers = await request('/api/admin/users');
     const admin = ((await currentUsers.json()) as { users: { id: string; username: string }[] }).users.find(user => user.username === 'integration-admin');
     expect(admin).toBeTruthy();
@@ -533,8 +592,50 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(viewerLogin.status).toBe(200);
     const viewerCookie = (viewerLogin.headers.get('set-cookie') || '').split(';', 1)[0];
     const viewerAuth = await viewerLogin.json() as { csrfToken: string };
+    const viewerAudioDownload=await fetch(`${baseUrl}/api/recordings/demo-recording-1/download?connectionId=mock&conversationId=demo-ava-agent-001`,{headers:{Cookie:viewerCookie}});
+    expect(viewerAudioDownload.status).toBe(403);
+    const viewerHistory=await (await fetch(`${baseUrl}/api/playback-history`,{headers:{Cookie:viewerCookie}})).json() as {total:number;page:number;pageSize:number;totalPages:number};
+    expect(viewerHistory).toMatchObject({total:0,page:1,pageSize:15,totalPages:1});
     const viewerAdminPage = await fetch(`${baseUrl}/api/admin/users`, { headers: { Cookie: viewerCookie } });
     expect(viewerAdminPage.status).toBe(403);
+    const roleRename=await request(`/api/admin/roles/${archiveRole.role.id}`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Archive Reader',permissions:{realtimePlayback:false,realtimeDownload:false,libraryPlayback:true,libraryAdmin:false}})},true);
+    expect(roleRename.status).toBe(200);
+    const roleUserCreate=await request('/api/admin/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'archive-reader',password:'Archive-Reader-Password-456!',role:archiveRole.role.id,connectionIds:[]})},true);
+    expect(roleUserCreate.status).toBe(201);
+    const archiveLogin=await fetch(`${baseUrl}/api/auth/login`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'archive-reader',password:'Archive-Reader-Password-456!'})});
+    expect(archiveLogin.status).toBe(200);
+    const archiveCookie=(archiveLogin.headers.get('set-cookie')||'').split(';',1)[0];
+    const archiveAuth=await archiveLogin.json() as {user:{role:string;permissions:{libraryPlayback:boolean;realtimePlayback:boolean};};csrfToken:string};
+    expect(archiveAuth.user).toMatchObject({role:archiveRole.role.id,permissions:{libraryPlayback:true,realtimePlayback:false}});
+    expect((await fetch(`${baseUrl}/api/library`,{headers:{Cookie:archiveCookie}})).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/library/destinations`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
+    expect((await fetch(`${baseUrl}/api/library/schedules`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
+    expect((await fetch(`${baseUrl}/api/library/worker-status`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
+    expect((await fetch(`${baseUrl}/api/recordings/conversations/demo-ava-agent-001?connectionId=mock`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
+    expect((await fetch(`${baseUrl}/api/dashboard/summary?connectionId=mock&start=2026-11-14T00:00:00.000Z&end=2026-11-15T00:00:00.000Z`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
+    const archiveSearch=await fetch(`${baseUrl}/api/recordings/search`,{method:'POST',headers:{'content-type':'application/json',Cookie:archiveCookie,'x-csrf-token':archiveAuth.csrfToken,Origin:'http://localhost:5173'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-10-01T00:00:00.000Z',intervalEnd:'2026-10-02T00:00:00.000Z'})});
+    expect(archiveSearch.status).toBe(403);
+    expect((await fetch(`${baseUrl}/api/genesys/directory?connectionId=mock&type=agent&q=Ni`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
+    const archiveAdminCreated=await request('/api/admin/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'archive-admin',password:'Archive-Admin-Password-456!',role:archiveAdminRole.role.id,connectionIds:[]})},true);
+    expect(archiveAdminCreated.status).toBe(201);
+    const archiveAdminLogin=await fetch(`${baseUrl}/api/auth/login`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'archive-admin',password:'Archive-Admin-Password-456!'})});
+    expect(archiveAdminLogin.status).toBe(200);
+    const archiveAdminCookie=(archiveAdminLogin.headers.get('set-cookie')||'').split(';',1)[0];
+    const archiveAdminAuth=await archiveAdminLogin.json() as {csrfToken:string;user:{permissions:{libraryPlayback:boolean;libraryAdmin:boolean;realtimePlayback:boolean}}};
+    expect(archiveAdminAuth.user.permissions).toMatchObject({libraryPlayback:true,libraryAdmin:true,realtimePlayback:false});
+    expect((await fetch(`${baseUrl}/api/library/schedules`,{headers:{Cookie:archiveAdminCookie}})).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/library/destinations`,{headers:{Cookie:archiveAdminCookie}})).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/recordings/search`,{method:'POST',headers:{'content-type':'application/json',Cookie:archiveAdminCookie,'x-csrf-token':archiveAdminAuth.csrfToken,Origin:'http://localhost:5173'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-10-01T00:00:00.000Z',intervalEnd:'2026-10-02T00:00:00.000Z'})})).status).toBe(403);
+    expect((await fetch(`${baseUrl}/api/genesys/connections`,{headers:{Cookie:archiveAdminCookie}})).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/genesys/directory?connectionId=mock&type=agent&q=Ni`,{headers:{Cookie:archiveAdminCookie}})).status).toBe(403);
+    const roleInUseDelete=await request(`/api/admin/roles/${archiveRole.role.id}`,{method:'DELETE'},true);
+    expect(roleInUseDelete.status).toBe(409);
+    const roleReassignment=await request(`/api/admin/users/${(await roleUserCreate.json() as {id:string}).id}/role`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({role:'viewer'})},true);
+    expect(roleReassignment.status).toBe(200);
+    const deleteRole=await request(`/api/admin/roles/${archiveRole.role.id}`,{method:'DELETE'},true);
+    expect(deleteRole.status).toBe(204);
+    const deleteArchiveAdminRole=await request(`/api/admin/roles/${archiveAdminRole.role.id}`,{method:'DELETE'},true);
+    expect(deleteArchiveAdminRole.status).toBe(409);
     const viewerRegionUpdate = await fetch(`${baseUrl}/api/genesys/regions`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', Cookie: viewerCookie, 'x-csrf-token': viewerAuth.csrfToken, Origin: 'http://localhost:5173' },
@@ -630,6 +731,9 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(bootstrapDatabase.prepare('PRAGMA table_info(users)').all()).toEqual(expect.arrayContaining([
       expect.objectContaining({name:'email'}),expect.objectContaining({name:'phone'}),expect.objectContaining({name:'first_name'}),expect.objectContaining({name:'last_name'}),expect.objectContaining({name:'nickname'}),expect.objectContaining({name:'job_title'}),expect.objectContaining({name:'division'}),expect.objectContaining({name:'department'}),
     ]));
+    const legacyRoleConstraint=String((bootstrapDatabase.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get() as {sql:string}).sql);
+    expect(legacyRoleConstraint).toContain("CHECK(role IN ('administrator','supervisor','quality_analyst','viewer'))");
+    expect(bootstrapDatabase.prepare("SELECT name FROM pragma_table_info('users') WHERE name='access_role_id'").get()).toBeTruthy();
     bootstrapDatabase.close();
   }, 30_000);
 

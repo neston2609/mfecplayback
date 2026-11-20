@@ -18,6 +18,7 @@ import { checkPasswordPolicy, isPasswordPolicySatisfied } from '../password-poli
 import { parseSmtpSettings, publicSmtpSettings } from '../mailer.js';
 import { DEFAULT_RECORDING_OUTPUT_FORMAT, ffmpegArguments, minimumExpectedAudioDurationMs, parseRecordingOutputFormat, preferredGenesysInputFormat, recordingOutputInfo, transcodeRecordingAudio, RECORDING_OUTPUT_FORMATS } from '../audio-transcode.js';
 import { groupMemberUserIds, searchDirectory } from '../genesys-directory.js';
+import { conversationHasPhoneMatch, normalizePhoneSearch, phoneSearchMatches } from '../phone-search.js';
 import { execFileSync } from 'node:child_process';
 import { libraryTabFromPath, pathForLibraryTab } from '../../src/library-navigation.js';
 import { mapParticipantUserNames, participantUserLookupId } from '../participant-users.js';
@@ -442,6 +443,19 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     await expect(searchDirectory(client as any,'queue','Customer')).resolves.toEqual([{id:'queue-1',name:'Customer Care'}]);
     await expect(groupMemberUserIds(client as any,'group-1')).resolves.toEqual(new Set(['agent-1']));
     expect(calls).toEqual(['/api/v2/users/search','/api/v2/routing/queues?name=*Customer*&pageSize=100&pageNumber=1','/api/v2/groups/group-1/members?pageSize=100&pageNumber=1']);
+  });
+
+  it('matches Thai phone numbers across local and international formats',()=>{
+    const formats=['0652936493','66652936493','+66652936493','0066652936493','065-293-6493'];
+    expect(formats.map(normalizePhoneSearch)).toEqual(Array(formats.length).fill('0652936493'));
+    for(const query of formats)for(const stored of formats)expect(phoneSearchMatches(stored,query)).toBe(true);
+    const conversation={participants:[{sessions:[{ani:'+66652936493',dnis:'+6621000101'}]}]};
+    expect(conversationHasPhoneMatch(conversation,'0652936493','phone')).toBe(true);
+    expect(conversationHasPhoneMatch(conversation,'021000101','dnis')).toBe(true);
+    expect(conversationHasPhoneMatch(conversation,'0652936493','dnis')).toBe(false);
+    expect(phoneSearchMatches('+6621000101','021000101')).toBe(true);
+    expect(phoneSearchMatches('sip:0652936493@genesys.example','0652936493')).toBe(false);
+    expect(phoneSearchMatches('+14155552671','0652936493')).toBe(false);
   });
 
   it.skipIf(!process.env.FFMPEG_PATH)('transcodes real audio into every supported audio-only container', async () => {

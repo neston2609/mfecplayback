@@ -1,6 +1,6 @@
 export const MOCK_CONVERSATIONS = [
   { conversationId: 'demo-ava-agent-001', conversationStart: '2026-11-16T03:15:21.000Z', conversationEnd: '2026-11-16T03:22:54.000Z', originatingDirection: 'inbound', externalTag: 'QA-DEMO-01', participants: [
-    { participantId: 'p-c1', purpose: 'customer', participantName: 'Customer', sessions: [{ ani: '+6621000101', dnis: '+6620000000', mediaType: 'voice', segments: [{ segmentStart: '2026-11-16T03:15:21.000Z', segmentEnd: '2026-11-16T03:22:54.000Z', segmentType: 'interact' }] }] },
+    { participantId: 'p-c1', purpose: 'customer', participantName: 'Customer', sessions: [{ ani: '+66652936493', dnis: '+6620000000', mediaType: 'voice', segments: [{ segmentStart: '2026-11-16T03:15:21.000Z', segmentEnd: '2026-11-16T03:22:54.000Z', segmentType: 'interact' }] }] },
     { participantId: 'p-f1', purpose: 'ivr', participantName: 'AVA Virtual Assistant', sessions: [{ mediaType: 'voice', flowId: 'flow-ava-01', flowName: 'AVA Service Assistant', segments: [{ segmentStart: '2026-11-16T03:15:23.000Z', segmentEnd: '2026-11-16T03:17:14.000Z', segmentType: 'interact' }] }] },
     { participantId: 'p-a1', purpose: 'agent', participantName: 'Nicha S.', userId: 'agent-101', sessions: [{ mediaType: 'voice', queueId: 'queue-care', queueName: 'Customer Care', segments: [{ segmentStart: '2026-11-16T03:18:02.000Z', segmentEnd: '2026-11-16T03:22:40.000Z', segmentType: 'interact', wrapUpCode: 'Resolved', wrapUpNote: 'Customer confirmed the issue was resolved after the account settings were updated.' }] }] },
   ] },

@@ -28,6 +28,7 @@ export function migrate() {
   for (const [column, definition] of Object.entries(profileColumns)) {
     if (!userColumns.has(column)) db.exec(`ALTER TABLE users ADD COLUMN ${column} ${definition}`);
   }
+  if (!userColumns.has('access_role_id')) db.exec('ALTER TABLE users ADD COLUMN access_role_id TEXT REFERENCES access_roles(id) ON DELETE SET NULL');
   const libraryScheduleColumns=new Set((db.prepare('PRAGMA table_info(library_schedules)').all() as {name:string}[]).map(column=>column.name));
   if(!libraryScheduleColumns.has('run_time'))db.exec("ALTER TABLE library_schedules ADD COLUMN run_time TEXT NOT NULL DEFAULT '02:00'");
   if(!libraryScheduleColumns.has('run_requested'))db.exec('ALTER TABLE library_schedules ADD COLUMN run_requested INTEGER NOT NULL DEFAULT 0');
