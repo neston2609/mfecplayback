@@ -624,7 +624,7 @@ app.get('/api/recordings/conversations/:conversationId/transcription', requireAu
       try {
         const value=await client.get<{url?:string}>(transcriptionRequestPath(conversationId,communicationId));
         if(!value?.url)return undefined;
-        const transcriptUrl=validateTranscriptUrl(value.url);
+        const transcriptUrl=validateTranscriptUrl(value.url,connection);
         let response:globalThis.Response;
         try{response=await fetch(transcriptUrl,{signal:AbortSignal.timeout(20000),redirect:'manual'});}catch{throw httpError(502,'Genesys transcription could not be retrieved.');}
         if(response.status>=300&&response.status<400){await response.body?.cancel().catch(()=>{});throw httpError(502,'Genesys transcript storage returned an unexpected redirect.');}

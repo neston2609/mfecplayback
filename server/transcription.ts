@@ -4,18 +4,22 @@ export function transcriptionRequestPath(conversationId: string, communicationId
   return `/api/v2/speechandtextanalytics/conversations/${encodeURIComponent(conversationId)}/communications/${encodeURIComponent(communicationId)}/transcripturl`;
 }
 
-export function validateTranscriptUrl(value: string): URL {
+export function validateTranscriptUrl(value: string, connection: { api_base_url: string }): URL {
   let url: URL;
   try { url = new URL(value); }
   catch { throw Object.assign(new Error('Genesys returned an invalid transcript URL.'), { status: 502 }); }
   const host = url.hostname.toLowerCase();
+  const apiHost = new URL(connection.api_base_url).hostname.toLowerCase();
+  const regionalDownloadHost = `api-downloads.${apiHost.replace(/^api\./, '')}`;
   const trustedS3Host = /^(?:[a-z0-9][a-z0-9.-]*\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$/.test(host);
   const query = url.searchParams;
-  const signed = Boolean(
+  const signedS3 = Boolean(
     (query.has('X-Amz-Signature') && query.has('X-Amz-Credential') && query.has('X-Amz-Date') && query.has('X-Amz-Expires')) ||
     (query.has('AWSAccessKeyId') && query.has('Signature') && query.has('Expires')),
   );
-  if (url.protocol !== 'https:' || url.username || url.password || url.port || !trustedS3Host || !signed) {
+  const signedRegionalDownload = query.has('Policy') && query.has('Signature') && query.has('Key-Pair-Id');
+  const regionalTranscriptCache = host === regionalDownloadHost && url.pathname.startsWith('/transcriptsCache/') && signedRegionalDownload;
+  if (url.protocol !== 'https:' || url.username || url.password || url.port || !(regionalTranscriptCache || (trustedS3Host && signedS3))) {
     throw Object.assign(new Error('Genesys returned a transcript URL on an untrusted host.'), { status: 502 });
   }
   return url;
