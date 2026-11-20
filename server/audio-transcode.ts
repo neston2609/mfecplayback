@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { finished } from 'node:stream/promises';
+import path from 'node:path';
 
 export const RECORDING_OUTPUT_FORMATS = ['m4a', 'mp4', 'mp3', 'wav', 'webm', 'ogg_opus', 'ogg_vorbis', 'wav_ulaw'] as const;
 export type RecordingOutputFormat = typeof RECORDING_OUTPUT_FORMATS[number];
@@ -51,12 +52,17 @@ export function ffmpegArguments(format: RecordingOutputFormat): string[] {
     case 'm4a': return [...args, '-c:a', 'aac', '-b:a', '128k', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'];
     case 'mp4': return [...args, '-c:a', 'aac', '-b:a', '128k', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'];
     case 'mp3': return [...args, '-c:a', 'libmp3lame', '-b:a', '192k', '-f', 'mp3', 'pipe:1'];
-    case 'wav': return [...args, '-c:a', 'pcm_s16le', '-f', 'wav', 'pipe:1'];
+    case 'wav': return [...args, '-c:a', 'pcm_s16le', '-rf64', 'always', '-f', 'wav', 'pipe:1'];
     case 'webm': return [...args, '-c:a', 'libopus', '-b:a', '96k', '-f', 'webm', 'pipe:1'];
     case 'ogg_opus': return [...args, '-c:a', 'libopus', '-b:a', '96k', '-f', 'ogg', 'pipe:1'];
     case 'ogg_vorbis': return [...args, '-c:a', 'libvorbis', '-q:a', '5', '-f', 'ogg', 'pipe:1'];
-    case 'wav_ulaw': return [...args, '-c:a', 'pcm_mulaw', '-ar', '8000', '-f', 'wav', 'pipe:1'];
+    case 'wav_ulaw': return [...args, '-c:a', 'pcm_mulaw', '-ar', '8000', '-rf64', 'always', '-f', 'wav', 'pipe:1'];
   }
+}
+
+export function minimumExpectedAudioDurationMs(expectedDurationMs: number): number {
+  if (!Number.isFinite(expectedDurationMs) || expectedDurationMs <= 0) return 0;
+  return Math.max(250, expectedDurationMs * 0.1);
 }
 
 function ffmpegValidationArguments(): string[] {
@@ -65,7 +71,7 @@ function ffmpegValidationArguments(): string[] {
 
 type FfmpegRunner = (input: Buffer, args: string[]) => Promise<Buffer>;
 
-export async function transcodeRecordingAudio(input: Buffer, requestedFormat: unknown, runner: FfmpegRunner = runFfmpeg): Promise<{ bytes: Buffer; format: RecordingOutputFormat; extension: string; mimeType: string }> {
+export async function transcodeRecordingAudio(input: Buffer, requestedFormat: unknown, runner: FfmpegRunner = runFfmpeg, expectedDurationMs?: number): Promise<{ bytes: Buffer; format: RecordingOutputFormat; extension: string; mimeType: string }> {
   const format = parseRecordingOutputFormat(requestedFormat);
   if (!input.length || input.length > MAX_INPUT_AUDIO_BYTES) throw new Error('Recording audio is empty or exceeds the 256 MB conversion limit.');
   await acquireTranscodeSlot();
@@ -77,11 +83,57 @@ export async function transcodeRecordingAudio(input: Buffer, requestedFormat: un
     } catch {
       throw new Error('Converted recording failed audio integrity validation and will not be archived.');
     }
+    const minimumDurationMs = minimumExpectedAudioDurationMs(expectedDurationMs ?? 0);
+    if (minimumDurationMs > 0) {
+      const durationMs = await probeAudioDurationMs(bytes);
+      if (durationMs < minimumDurationMs) {
+        throw new Error(`Converted recording is only ${(durationMs / 1000).toFixed(2)} seconds long; audio integrity validation rejected the unexpectedly short recording.`);
+      }
+    }
     return { bytes, format, ...recordingOutputInfo(format) };
   } finally {
     activeTranscodes--;
     transcodeQueue.shift()?.();
   }
+}
+
+function probeAudioDurationMs(input: Buffer): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const configured = process.env.FFMPEG_PATH || '';
+    const probeName = configured ? path.basename(configured).replace(/ffmpeg(?=\.exe?$)/i, match => match.toLowerCase().endsWith('.exe') ? 'ffprobe.exe' : 'ffprobe') : (process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+    const executable = configured && (configured.includes('/') || configured.includes('\\')) ? path.join(path.dirname(configured), probeName) : probeName;
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(executable, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', '-i', 'pipe:0'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    } catch {
+      reject(new Error('Audio duration validation could not start. Install FFprobe with FFmpeg.'));
+      return;
+    }
+    const output: Buffer[] = [];
+    let outputBytes = 0, settled = false;
+    const finish = (error?: Error, durationMs?: number) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error); else resolve(durationMs!);
+    };
+    const timeout = setTimeout(() => { child.kill(); finish(new Error('Audio duration validation exceeded its time limit.')); }, 10_000);
+    timeout.unref();
+    child.once('error', () => finish(new Error('Audio duration validation is unavailable. Install FFprobe with FFmpeg.')));
+    child.stderr!.on('data', () => {});
+    child.stdout!.on('data', (chunk: Buffer) => {
+      outputBytes += chunk.length;
+      if (outputBytes > 1024) { child.kill(); finish(new Error('Audio duration validation returned invalid data.')); return; }
+      output.push(Buffer.from(chunk));
+    });
+    child.once('close', code => {
+      if (settled) return;
+      const seconds = Number(Buffer.concat(output).toString('utf8').trim());
+      if (code !== 0 || !Number.isFinite(seconds) || seconds < 0) finish(new Error('Audio duration validation could not read the converted recording.'));
+      else finish(undefined, seconds * 1000);
+    });
+    child.stdin!.end(input);
+  });
 }
 
 function acquireTranscodeSlot(): Promise<void> {

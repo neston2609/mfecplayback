@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { deflateRawSync } from 'node:zlib';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { DEFAULT_REGIONS, trustedBaseUrl, validateRegionEndpoints } from '../regions.js';
 import { encrypt, decrypt } from '../security.js';
 import { MOCK_CONVERSATIONS, MOCK_RECORDINGS } from '../mock.js';
@@ -13,7 +16,8 @@ import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from
 import { aiConversationSummaryPath, analyticsConversationDetailsPath, avaConversationSummaryPath, fetchConversationSummaryArtifacts, transcriptSearchCommunicationIds, transcriptSearchPath, transcriptSearchRequest } from '../conversation-artifacts.js';
 import { checkPasswordPolicy, isPasswordPolicySatisfied } from '../password-policy.js';
 import { parseSmtpSettings, publicSmtpSettings } from '../mailer.js';
-import { DEFAULT_RECORDING_OUTPUT_FORMAT, ffmpegArguments, parseRecordingOutputFormat, preferredGenesysInputFormat, recordingOutputInfo, transcodeRecordingAudio, RECORDING_OUTPUT_FORMATS } from '../audio-transcode.js';
+import { DEFAULT_RECORDING_OUTPUT_FORMAT, ffmpegArguments, minimumExpectedAudioDurationMs, parseRecordingOutputFormat, preferredGenesysInputFormat, recordingOutputInfo, transcodeRecordingAudio, RECORDING_OUTPUT_FORMATS } from '../audio-transcode.js';
+import { groupMemberUserIds, searchDirectory } from '../genesys-directory.js';
 import { execFileSync } from 'node:child_process';
 import { libraryTabFromPath, pathForLibraryTab } from '../../src/library-navigation.js';
 import { mapParticipantUserNames, participantUserLookupId } from '../participant-users.js';
@@ -422,19 +426,53 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     await expect(transcodeRecordingAudio(input,'mp3',async()=>Buffer.alloc(0))).rejects.toThrow(/empty/i);
   });
 
+  it('sets a conservative minimum expected audio duration threshold',()=>{
+    expect(minimumExpectedAudioDurationMs(0)).toBe(0);
+    expect(minimumExpectedAudioDurationMs(400)).toBe(250);
+    expect(minimumExpectedAudioDurationMs(30_000)).toBe(3000);
+  });
+
+  it('searches directory names and reads members for a selected Genesys group',async()=>{
+    const calls:string[]=[];
+    const client={
+      async post<T>(endpoint:string,body:any):Promise<T>{calls.push(endpoint);expect(body.query[0]).toMatchObject({type:'CONTAINS',fields:['name'],value:'Nicha'});return {results:[{id:'agent-1',name:'Nicha S.'}]} as T;},
+      async get<T>(endpoint:string):Promise<T>{calls.push(endpoint);if(endpoint.startsWith('/api/v2/routing/queues?'))return {entities:[{id:'queue-1',name:'Customer Care'}]} as T;return {entities:[{id:'agent-1'}],total:1} as T;},
+    };
+    await expect(searchDirectory(client as any,'agent','Nicha')).resolves.toEqual([{id:'agent-1',name:'Nicha S.'}]);
+    await expect(searchDirectory(client as any,'queue','Customer')).resolves.toEqual([{id:'queue-1',name:'Customer Care'}]);
+    await expect(groupMemberUserIds(client as any,'group-1')).resolves.toEqual(new Set(['agent-1']));
+    expect(calls).toEqual(['/api/v2/users/search','/api/v2/routing/queues?name=*Customer*&pageSize=100&pageNumber=1','/api/v2/groups/group-1/members?pageSize=100&pageNumber=1']);
+  });
+
   it.skipIf(!process.env.FFMPEG_PATH)('transcodes real audio into every supported audio-only container', async () => {
     const ffmpeg=process.env.FFMPEG_PATH!,ffprobe=ffmpeg.replace(/ffmpeg(?:\.exe)?$/i,match=>match.toLowerCase().endsWith('.exe')?'ffprobe.exe':'ffprobe');
-    const input=execFileSync(ffmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','sine=frequency=1000:duration=0.2','-c:a','pcm_s16le','-ar','8000','-ac','1','-f','wav','pipe:1'],{maxBuffer:1024*1024});
-    for(const format of RECORDING_OUTPUT_FORMATS){
-      const converted=await transcodeRecordingAudio(input,format);
-      const output=execFileSync(ffmpeg,['-hide_banner','-loglevel','error','-protocol_whitelist','pipe','-i','pipe:0','-c','copy','-f','matroska','pipe:1'],{input:converted.bytes,maxBuffer:4*1024*1024});
-      const probe=JSON.parse(execFileSync(ffprobe,['-v','error','-show_entries','stream=codec_type,codec_name:format=format_name','-of','json','-i','pipe:0'],{input:output,encoding:'utf8'}));
-      expect(probe.streams).toHaveLength(1);
-      expect(probe.streams[0].codec_type).toBe('audio');
-      expect(probe.streams[0].codec_name).toBe(format==='m4a'||format==='mp4'?'aac':format==='mp3'?'mp3':format==='webm'?'opus':format==='ogg_opus'?'opus':format==='ogg_vorbis'?'vorbis':format==='wav_ulaw'?'pcm_mulaw':'pcm_s16le');
-      expect(converted.bytes.length).toBeGreaterThan(0);
-    }
+    const fixture=path.join(os.tmpdir(),`mfec-transcode-${process.pid}.wav`);
+    try{
+      execFileSync(ffmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','sine=frequency=1000:duration=0.2','-c:a','pcm_s16le','-ar','8000','-ac','1','-y',fixture]);
+      const input=fs.readFileSync(fixture);
+      for(const format of RECORDING_OUTPUT_FORMATS){
+        const converted=await transcodeRecordingAudio(input,format);
+        const convertedPath=path.join(os.tmpdir(),`mfec-converted-${process.pid}-${format}.${format.startsWith('ogg_')?'ogg':format==='wav_ulaw'?'wav':format}`);
+        try{
+          fs.writeFileSync(convertedPath,converted.bytes);
+          const probe=JSON.parse(execFileSync(ffprobe,['-v','error','-show_entries','stream=codec_type,codec_name:format=format_name','-of','json',convertedPath],{encoding:'utf8'}));
+          expect(probe.streams).toHaveLength(1);
+          expect(probe.streams[0].codec_type).toBe('audio');
+          expect(probe.streams[0].codec_name).toBe(format==='m4a'||format==='mp4'?'aac':format==='mp3'?'mp3':format==='webm'?'opus':format==='ogg_opus'?'opus':format==='ogg_vorbis'?'vorbis':format==='wav_ulaw'?'pcm_mulaw':'pcm_s16le');
+          expect(converted.bytes.length).toBeGreaterThan(0);
+        }finally{fs.rmSync(convertedPath,{force:true});}
+      }
+    }finally{fs.rmSync(fixture,{force:true});}
   },60_000);
+
+  it.skipIf(!process.env.FFMPEG_PATH)('rejects converted audio that is much shorter than the Genesys recording metadata', async () => {
+    const ffmpeg=process.env.FFMPEG_PATH!;
+    const fixture=path.join(os.tmpdir(),`mfec-short-audio-${process.pid}.wav`);
+    try{
+      execFileSync(ffmpeg,['-hide_banner','-loglevel','error','-f','lavfi','-i','sine=frequency=1000:duration=0.25','-c:a','pcm_s16le','-ar','8000','-ac','1','-y',fixture]);
+      await expect(transcodeRecordingAudio(fs.readFileSync(fixture),'m4a',undefined,30_000)).rejects.toThrow(/unexpectedly short recording/i);
+    }finally{fs.rmSync(fixture,{force:true});}
+  },30_000);
 
   it('uses the media URI from the matching recording list item when detail metadata has none', async () => {
     const requested: string[] = [];

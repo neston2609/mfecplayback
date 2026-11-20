@@ -115,7 +115,7 @@ For example, from `1.8.6` these produce `2.0.0`, `1.9.0`, and `1.8.7`. Commit th
 4. Run `npm run db:migrate`, `npm run build`, then start with the systemd unit below.
 5. Terminate TLS at Nginx. Keep the Node listener loopback-only, use HTTPS/HSTS, restrict administrative access, firewall only required ports, and protect backups.
 
-Library Settings lets an administrator choose the output format used for direct recording downloads and new Scheduled Archive recordings: M4A/AAC (default), audio-only MP4/AAC, MP3, WAV/PCM, WebM/Opus, OGG/Opus, OGG/Vorbis, or WAV/μ-law. FFmpeg performs the conversion; existing archived audio is not rewritten when this setting changes.
+Library Settings lets an administrator choose the output format used for direct recording downloads and new Scheduled Archive recordings: M4A/AAC (default), audio-only MP4/AAC, MP3, WAV/PCM, WebM/Opus, OGG/Opus, OGG/Vorbis, or WAV/μ-law. FFmpeg and FFprobe perform conversion and audio integrity/duration validation; existing archived audio is not rewritten when this setting changes. Re-archive writes and verifies a new copy before updating the index or removing the previous archive.
 
 Example systemd unit (`/etc/systemd/system/mfec-recording-explorer.service`):
 
@@ -184,7 +184,7 @@ Stop the service or use SQLite's online backup mechanism to produce a consistent
 ## Search semantics and known limitations
 
 - Genesys analytics requests are limited to a seven-day interval here to stay within the documented no-filter detail-query maximum. Filtered-query limits and asynchronous jobs should be validated for the target data volume; large-range async details jobs are not yet implemented.
-- User/queue/direction filters are sent to Analytics where supported. Agent/queue IDs currently require IDs; reference-data APIs are not yet implemented.
+- Agent, queue, and group name suggestions use the selected Genesys organization. Agent and queue selections are mapped to IDs for Analytics filtering; group membership is applied after retrieval and may be partial when the Analytics conversation cap is reached. Names must match a returned suggestion.
 - ANI/DNIS in native Genesys mode are post-filtered only on the current result page and are clearly marked incomplete. Do not use them as a complete customer-phone search.
 - Recording availability is verified per returned conversation by calling the conversation recordings endpoint. A successful conversation query does not imply an available recording.
 - Participant purpose and returned flow fields are used as classification signals. Names alone are not sufficient for bot classification; admin-managed flow mapping is schema-ready but not yet surfaced.

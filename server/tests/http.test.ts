@@ -260,6 +260,20 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(result.results.every(row => row.recordingCount > 0)).toBe(true);
     expect(result.results.every(row => row.recordings.every(recording => recording.mediaType === 'voice'))).toBe(true);
 
+    const agentSuggestions=await request('/api/genesys/directory?connectionId=mock&type=agent&q=nich');
+    expect(agentSuggestions.status).toBe(200);
+    expect(await agentSuggestions.json()).toMatchObject({suggestions:[{id:'agent-101',name:'Nicha S.'}]});
+    const groupSuggestions=await request('/api/genesys/directory?connectionId=mock&type=group&q=support');
+    expect(await groupSuggestions.json()).toMatchObject({suggestions:[{id:'group-support',name:'Customer Support'}]});
+    const queueSuggestions=await request('/api/genesys/directory?connectionId=mock&type=queue&q=customer');
+    expect(await queueSuggestions.json()).toMatchObject({suggestions:[{id:'queue-care',name:'Customer Care'}]});
+    const byAgentName=await request('/api/recordings/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-11-14T00:00:00.000Z',intervalEnd:'2026-11-17T00:00:00.000Z',pageNumber:1,pageSize:25,agentName:'Nicha S.'})},true);
+    expect((await byAgentName.json() as {results:{conversationId:string}[]}).results.map(row=>row.conversationId)).toEqual(['demo-ava-agent-001']);
+    const byQueueName=await request('/api/recordings/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-11-14T00:00:00.000Z',intervalEnd:'2026-11-17T00:00:00.000Z',pageNumber:1,pageSize:25,queueName:'Customer Care'})},true);
+    expect((await byQueueName.json() as {results:{conversationId:string}[]}).results.map(row=>row.conversationId)).toEqual(['demo-ava-agent-001']);
+    const byGroupName=await request('/api/recordings/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-11-14T00:00:00.000Z',intervalEnd:'2026-11-17T00:00:00.000Z',pageNumber:1,pageSize:25,groupName:'Customer Support'})},true);
+    expect((await byGroupName.json() as {results:{conversationId:string}[]}).results.map(row=>row.conversationId)).toEqual(['demo-ava-agent-001']);
+
     const conversationRecordings=await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock');
     expect(conversationRecordings.status).toBe(200);
     expect(await conversationRecordings.json()).toMatchObject([{id:'demo-recording-1',mediaType:'voice'}]);
