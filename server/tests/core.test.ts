@@ -11,7 +11,7 @@ import { queryAllConversations, VOICE_RECORDING_FILTERS } from '../conversation-
 import { archivedConversationDisplay, collectQueueIds, conversationQueueNames, conversationWrapUpCodeNames, participantLines, summarizeConversation, withParticipantLines } from '../conversation-summary.js';
 import { conversationHasVoiceSession, getRecordingMedia, isMessageRecording, isVoiceInteraction, isVoiceRecording, isZipMediaContentType, listVoiceRecordings, recordingMediaRequestPath, recordingMetadataRequestPath, recordingMediaUriForFormats, validateRecordingMediaUrl } from '../recording-media.js';
 import { extractSingleAudioFromZip } from '../zip-audio.js';
-import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
+import { conversationCommunicationIds, normalizeTranscriptionError, transcriptionRequestPath, validateTranscriptUrl } from '../transcription.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from '../wrapup.js';
 import { aiConversationSummaryPath, analyticsConversationDetailsPath, avaConversationSummaryPath, fetchConversationSummaryArtifacts, transcriptSearchCommunicationIds, transcriptSearchPath, transcriptSearchRequest } from '../conversation-artifacts.js';
 import { checkPasswordPolicy, isPasswordPolicySatisfied } from '../password-policy.js';
@@ -598,6 +598,14 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(validateTranscriptUrl(good).hostname).toBe('genesys-transcripts.s3.amazonaws.com');
     expect(()=>validateTranscriptUrl('https://attacker.example/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600')).toThrow(/untrusted/i);
     expect(()=>validateTranscriptUrl('http://genesys-transcripts.s3.amazonaws.com/file.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600')).toThrow(/untrusted/i);
+    expect(()=>validateTranscriptUrl('invalid-url')).toThrow(/invalid transcript URL/i);
+    try{validateTranscriptUrl('invalid-url');}catch(error){expect(error).toMatchObject({status:502});}
+  });
+
+  it('returns a safe actionable gateway error for transcription service failures',()=>{
+    expect(normalizeTranscriptionError(Object.assign(new Error('Genesys API request failed'),{status:500}))).toMatchObject({status:502,message:expect.stringContaining('Speech and Text Analytics')});
+    const unavailable=Object.assign(new Error('Transcription is not available.'),{status:404});
+    expect(normalizeTranscriptionError(unavailable)).toBe(unavailable);
   });
 
   it('builds the explicit Genesys summary, details, and transcript search API requests', () => {

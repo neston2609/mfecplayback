@@ -9,7 +9,7 @@ import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { extractSingleAudioFromZip } from './zip-audio.js';
 import { parseByteRange } from './audio-range.js';
-import { conversationCommunicationIds, transcriptionRequestPath, validateTranscriptUrl } from './transcription.js';
+import { conversationCommunicationIds, normalizeTranscriptionError, transcriptionRequestPath, validateTranscriptUrl } from './transcription.js';
 import { analyticsConversationDetailsPath, fetchConversationSummaryArtifacts, transcriptSearchCommunicationIds, transcriptSearchPath, transcriptSearchRequest } from './conversation-artifacts.js';
 import { collectAfterCallNotes, collectWrapUpCodeIds, withWrapUpCodeNames } from './wrapup.js';
 import { db, migrate } from './db/index.js';
@@ -647,7 +647,7 @@ app.get('/api/recordings/conversations/:conversationId/transcription', requireAu
     res.setHeader('Cache-Control','private, no-store, no-cache, must-revalidate');
     res.setHeader('X-Content-Type-Options','nosniff');
     res.json({conversationId,generatedAt:new Date().toISOString(),transcriptions:available});
-  } catch(error) { next(error); }
+  } catch(error) { next(normalizeTranscriptionError(error)); }
 });
 app.get('/api/recordings/:recordingId/stream', requireAuth, requireRealtimePlayback, async (req,res,next) => {
   let playbackConnection:Connection|undefined;
