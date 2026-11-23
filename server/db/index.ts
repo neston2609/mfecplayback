@@ -36,6 +36,12 @@ export function migrate() {
   const archivedRecordingColumns=new Set((db.prepare('PRAGMA table_info(archived_recordings)').all() as {name:string}[]).map(column=>column.name));
   if(!archivedRecordingColumns.has('flows'))db.exec("ALTER TABLE archived_recordings ADD COLUMN flows TEXT NOT NULL DEFAULT '[]'");
   if(!archivedRecordingColumns.has('interaction_type'))db.exec("ALTER TABLE archived_recordings ADD COLUMN interaction_type TEXT NOT NULL DEFAULT 'Unknown'");
+  db.exec(`CREATE TABLE IF NOT EXISTS recording_playability (
+    connection_id TEXT NOT NULL, conversation_id TEXT NOT NULL, recording_id TEXT NOT NULL,
+    is_unplayable INTEGER NOT NULL DEFAULT 1 CHECK(is_unplayable IN (0,1)),
+    marked_by TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY(connection_id,conversation_id,recording_id)
+  )`);
   db.prepare(`UPDATE connections
     SET api_base_url='https://api.apse1.pure.cloud', oauth_base_url='https://login.apse1.pure.cloud',
         last_success_at=NULL, last_error=NULL, updated_at=?

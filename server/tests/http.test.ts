@@ -178,6 +178,12 @@ describe('HTTP API security and Mock Mode flows', () => {
     archiveDb.prepare('INSERT INTO connections(id,name,organization_label,region_id,api_base_url,oauth_base_url,client_id,client_secret_enc,enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,0,?,?)').run('00000000-0000-4000-8000-000000000031','rearchive mock connection','test','us-east-1','https://api.mypurecloud.com','https://login.mypurecloud.com','test-client','',audioNow,audioNow);
     archiveDb.prepare("UPDATE archived_recordings SET connection_id='00000000-0000-4000-8000-000000000031' WHERE id=?").run(archivedId);
     archiveDb.close();
+    const archiveMark=await request('/api/recordings/playability',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'00000000-0000-4000-8000-000000000031',conversationId:'range-test-conversation',recordingId:'range-test-recording',unplayable:true,source:'archive',archiveId:archivedId})},true);
+    expect(archiveMark.status).toBe(200);
+    expect(await (await request('/api/library')).json()).toMatchObject({items:[],total:0});
+    expect(await (await request('/api/library?showUnplayable=true')).json()).toMatchObject({items:[{id:archivedId,unplayable:true}],total:1});
+    const archiveUnmark=await request('/api/recordings/playability',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'00000000-0000-4000-8000-000000000031',conversationId:'range-test-conversation',recordingId:'range-test-recording',unplayable:false,source:'archive',archiveId:archivedId})},true);
+    expect(archiveUnmark.status).toBe(200);
     const rangedAudio=await request(`/api/library/${archivedId}/audio`,{headers:{Range:'bytes=2-5'}});
     expect(rangedAudio.status).toBe(206);
     expect(rangedAudio.headers.get('content-range')).toBe('bytes 2-5/10');
@@ -265,6 +271,14 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(result.results).toHaveLength(3);
     expect(result.results.every(row => row.recordingCount > 0)).toBe(true);
     expect(result.results.every(row => row.recordings.every(recording => recording.mediaType === 'voice'))).toBe(true);
+    expect((await request('/api/recordings/playability',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',conversationId:'demo-ava-agent-001',recordingId:'demo-recording-1',unplayable:true})},true)).status).toBe(200);
+    expect((await (await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock')).json() as {id:string}[]).map(item=>item.id)).toEqual([]);
+    expect((await (await request('/api/recordings/conversations/demo-ava-agent-001/recordings?connectionId=mock&showUnplayable=true')).json() as {id:string;unplayable:boolean}[])).toMatchObject([{id:'demo-recording-1',unplayable:true}]);
+    const hiddenMarked=await request('/api/recordings/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-11-14T00:00:00.000Z',intervalEnd:'2026-11-17T00:00:00.000Z',pageNumber:1,pageSize:25})},true);
+    expect((await hiddenMarked.json() as {results:{conversationId:string}[];totalHits:number}).results.map(row=>row.conversationId)).toEqual(['demo-bot-only-002','demo-transfer-003']);
+    const shownMarked=await request('/api/recordings/search',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-11-14T00:00:00.000Z',intervalEnd:'2026-11-17T00:00:00.000Z',pageNumber:1,pageSize:25,showUnplayable:true})},true);
+    expect((await shownMarked.json() as {results:{conversationId:string;recordings:{id:string;unplayable:boolean}[]}[];totalHits:number}).results.find(row=>row.conversationId==='demo-ava-agent-001')?.recordings).toMatchObject([{id:'demo-recording-1',unplayable:true}]);
+    expect((await request('/api/recordings/playability',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'mock',conversationId:'demo-ava-agent-001',recordingId:'demo-recording-1',unplayable:false})},true)).status).toBe(200);
 
     const agentSuggestions=await request('/api/genesys/directory?connectionId=mock&type=agent&q=nich');
     expect(agentSuggestions.status).toBe(200);
@@ -367,6 +381,8 @@ describe('HTTP API security and Mock Mode flows', () => {
       liveCsrf = (await login.json() as { csrfToken: string }).csrfToken;
       const migratedDatabase=new Database(path.join(liveDirectory,'integration.sqlite'),{readonly:true});
       const migratedUserColumns=(migratedDatabase.prepare('PRAGMA table_info(users)').all() as {name:string}[]).map(column=>column.name);
+      const playabilityColumns=(migratedDatabase.prepare('PRAGMA table_info(recording_playability)').all() as {name:string}[]).map(column=>column.name);
+      expect(playabilityColumns).toContain('is_unplayable');
       expect(migratedUserColumns).toContain('access_role_id');
       expect(migratedUserColumns).toContain('department');
       const legacyRoleConstraint=(migratedDatabase.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get() as {sql:string}).sql;
