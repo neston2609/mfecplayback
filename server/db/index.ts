@@ -35,7 +35,19 @@ export function migrate() {
   if(!libraryScheduleColumns.has('lookback_days'))db.exec('ALTER TABLE library_schedules ADD COLUMN lookback_days INTEGER NOT NULL DEFAULT 550');
   const archivedRecordingColumns=new Set((db.prepare('PRAGMA table_info(archived_recordings)').all() as {name:string}[]).map(column=>column.name));
   if(!archivedRecordingColumns.has('flows'))db.exec("ALTER TABLE archived_recordings ADD COLUMN flows TEXT NOT NULL DEFAULT '[]'");
+  if(!archivedRecordingColumns.has('media_type'))db.exec("ALTER TABLE archived_recordings ADD COLUMN media_type TEXT NOT NULL DEFAULT 'audio'");
   if(!archivedRecordingColumns.has('interaction_type'))db.exec("ALTER TABLE archived_recordings ADD COLUMN interaction_type TEXT NOT NULL DEFAULT 'Unknown'");
+  db.exec(`CREATE TABLE IF NOT EXISTS library_metadata_backfill (
+    archive_id TEXT PRIMARY KEY REFERENCES archived_recordings(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','failed','done')),
+    attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS library_metadata_backfill_status_idx ON library_metadata_backfill(status,updated_at)');
+  db.exec(`CREATE TABLE IF NOT EXISTS s3_sources (id TEXT PRIMARY KEY, name TEXT NOT NULL, bucket TEXT NOT NULL, region TEXT NOT NULL, prefix TEXT NOT NULL DEFAULT '', organization_id TEXT NOT NULL DEFAULT '', genesys_connection_id TEXT REFERENCES connections(id) ON DELETE RESTRICT, access_key_id_enc TEXT NOT NULL, secret_access_key_enc TEXT NOT NULL, session_token_enc TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, created_by TEXT REFERENCES users(id) ON DELETE SET NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+  const s3SourceColumns=new Set((db.prepare('PRAGMA table_info(s3_sources)').all() as {name:string}[]).map(column=>column.name));
+  if(!s3SourceColumns.has('genesys_connection_id'))db.exec('ALTER TABLE s3_sources ADD COLUMN genesys_connection_id TEXT REFERENCES connections(id) ON DELETE RESTRICT');
+  db.exec('CREATE INDEX IF NOT EXISTS s3_sources_enabled_name_idx ON s3_sources(enabled,name)');
+  db.prepare("UPDATE library_metadata_backfill SET status='pending',updated_at=? WHERE status='running'").run(new Date().toISOString());
   db.exec(`CREATE TABLE IF NOT EXISTS recording_playability (
     connection_id TEXT NOT NULL, conversation_id TEXT NOT NULL, recording_id TEXT NOT NULL,
     is_unplayable INTEGER NOT NULL DEFAULT 1 CHECK(is_unplayable IN (0,1)),

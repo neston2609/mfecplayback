@@ -120,6 +120,9 @@ function probeAudioDurationMs(input: Buffer): Promise<number> {
     const timeout = setTimeout(() => { child.kill(); finish(new Error('Audio duration validation exceeded its time limit.')); }, 10_000);
     timeout.unref();
     child.once('error', () => finish(new Error('Audio duration validation is unavailable. Install FFprobe with FFmpeg.')));
+    child.stdin!.once('error', () => {
+      if (!settled) finish(new Error('Audio duration validation input stream failed.'));
+    });
     child.stderr!.on('data', () => {});
     child.stdout!.on('data', (chunk: Buffer) => {
       outputBytes += chunk.length;
@@ -182,6 +185,11 @@ function runFfmpeg(input: Buffer, args: string[]): Promise<Buffer> {
       finish(error.message.includes('ENOENT')
         ? new Error('Audio conversion is unavailable. Install FFmpeg and ensure it is available to the application service.')
         : new Error('Audio conversion could not start.'));
+    });
+    child.stdin!.once('error', error => {
+      if (!settled) finish(new Error((error as NodeJS.ErrnoException).code === 'EPIPE'
+        ? 'Audio conversion stopped before the recording input was fully written.'
+        : 'Audio conversion input stream failed.'));
     });
     child.stdout!.on('data', (chunk: Buffer) => {
       outputBytes += chunk.length;

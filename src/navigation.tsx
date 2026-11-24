@@ -6,7 +6,7 @@ export const navGroups=[
   {title:'Overview',items:[['Dashboard','/dashboard',LayoutDashboard],['Recording Search','/search',Search]]},
   {title:'Workspace',items:[['Playback History','/history',History],['Audit Logs','/audit',ShieldCheck]]},
   {title:'Sound Library',items:[['Library','/library',Archive],['Schedule Archive','/library/schedules',History],['Worker Status','/library/worker',Activity],['Library Setting','/library/settings',Settings]]},
-  {title:'Administration',items:[['Genesys Configuration','/connections',Activity],['Genesys Regions','/regions',Globe2],['Users & Access','/access',Users],['Settings','/settings',Settings]]},
+  {title:'Administration',items:[['Source Configuration','/connections',Activity],['Genesys Regions','/regions',Globe2],['Users & Access','/access',Users],['Settings','/settings',Settings]]},
 ] as const;
 
 export function NavigationSidebar({mobile,path,user,autoCollapseSubmenu,onNavigate}:{mobile:boolean;path:string;user:User;autoCollapseSubmenu:boolean;onNavigate:(to:string)=>void}){
@@ -21,7 +21,7 @@ export function NavigationSidebar({mobile,path,user,autoCollapseSubmenu,onNaviga
         if(href==='/dashboard'&&!canRealtime)return false;
         if(href==='/audit'&&!isAdmin)return false;
         if(label==='Genesys Regions'&&!isAdmin)return false;
-        if((label==='Users & Access'||label==='Genesys Configuration')&&!isAdmin)return false;
+        if((label==='Users & Access'||label==='Source Configuration')&&!isAdmin)return false;
         if((label==='Schedule Archive'||label==='Worker Status'||label==='Library Setting')&&!isAdmin&&!permissions?.libraryAdmin)return false;
         if(href==='/search'&&!canRealtime)return false;
         if(href==='/library'&&!canLibrary)return false;

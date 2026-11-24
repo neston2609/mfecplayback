@@ -25,10 +25,122 @@ import { mapParticipantUserNames, participantUserLookupId } from '../participant
 import { byteRangeStream, parseByteRange } from '../audio-range.js';
 import { Readable } from 'node:stream';
 import { initialArchiveCursor } from '../library-schedule.js';
+import { fetchConversationTranscriptions } from '../conversation-transcription.js';
+import { decryptS3Source, getS3RecordingAudio, normalizeExportMetadata, publicS3Source, s3SourceConfigJson, s3SourceSchema, searchS3Recordings } from '../s3-source.js';
+import { isScreenRecording, listConversationRecordings, listPlayableRecordings, safeRecordingMetadata } from '../recording-media.js';
+import { extractScreenTracksFromZip, screenTrackFromWebm } from '../screen-recording.js';
+import { cacheScreenTracks, getCachedScreenTrack } from '../screen-cache.js';
+import { tracksFromBytes } from '../screen-media.js';
 
 describe('MFEC Recording Explorer security and synthetic fixtures', () => {
   beforeAll(() => { process.env.MASTER_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64'); });
   afterAll(() => { delete process.env.MASTER_ENCRYPTION_KEY; });
+
+  it('encrypts AWS credentials at rest and excludes credential material from public source data',()=>{
+    const parsed=s3SourceSchema.parse({name:'Cloud CX exports',bucket:'mfec-recordings-prod',region:'ap-southeast-1',prefix:'',organizationId:'org-123',accessKeyId:'AKIA_TEST',secretAccessKey:'secret-test-value',sessionToken:'token-test-value'});
+    const config={...parsed,accessKeyId:parsed.accessKeyId!,secretAccessKey:parsed.secretAccessKey!};
+    const encrypted=s3SourceConfigJson(config);
+    expect(encrypted.accessKeyId).not.toContain(config.accessKeyId);
+    expect(encrypted.secretAccessKey).not.toContain(config.secretAccessKey);
+    expect(encrypted.sessionToken).not.toContain(config.sessionToken);
+    const row={id:'source-1',name:config.name,bucket:config.bucket,region:config.region,prefix:config.prefix,organization_id:config.organizationId,genesys_connection_id:null,access_key_id_enc:encrypted.accessKeyId,secret_access_key_enc:encrypted.secretAccessKey,session_token_enc:encrypted.sessionToken,enabled:1,created_at:'now',updated_at:'now'};
+    expect(decryptS3Source(row)).toMatchObject({accessKeyId:config.accessKeyId,secretAccessKey:config.secretAccessKey,sessionToken:config.sessionToken});
+    const visible=publicS3Source(row);
+    expect(visible).toMatchObject({id:'source-1',credentialsConfigured:true,hasSessionToken:true});
+    expect(JSON.stringify(visible)).not.toContain('secret-test-value');
+    expect(JSON.stringify(visible)).not.toContain('token-test-value');
+  });
+
+  it('validates the configured AWS source fields and rejects unsafe bucket prefixes',()=>{
+    expect(s3SourceSchema.safeParse({name:'S3',bucket:'valid-bucket-1',region:'ap-southeast-1',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'}).success).toBe(true);
+    expect(s3SourceSchema.safeParse({name:'S3',bucket:'Bad_Bucket',region:'ap-southeast-1',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'}).success).toBe(false);
+    expect(s3SourceSchema.safeParse({name:'S3',bucket:'valid-bucket-1',region:'ap-southeast-1',organizationId:'org-123',prefix:'recordings/../private',accessKeyId:'key',secretAccessKey:'secret'}).success).toBe(false);
+  });
+
+  it('normalizes Genesys export metadata and verifies voice fields and the storage path date',()=>{
+    const parsed=s3SourceSchema.parse({name:'Archive',bucket:'mfec-genesys-exports',region:'ap-southeast-1',prefix:'exports',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'});
+    const config={...parsed,accessKeyId:parsed.accessKeyId!,secretAccessKey:parsed.secretAccessKey!};
+    const key='exports/org-123/year=2026/month=11/day=23/hour=10/conversation_id=conv-1/recording-1_metadata.json';
+    const normalized=normalizeExportMetadata({organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z',durationMs:8250,initialDirection:'inbound',ani:'+6620000000',dnis:'020000000',userIds:['agent-1'],queueIds:['queue-1'],wrapUpCodeIds:['wrap-1'],mediaType:'voice'},key,config);
+    expect(normalized).toMatchObject({conversationId:'conv-1',conversationStart:'2026-11-23T10:14:00.000Z',direction:'inbound',ani:'+6620000000',dnis:'020000000',agents:['agent-1'],queues:['queue-1'],wrapUp:'wrap-1',recordingCount:1,recordings:[{id:'recording-1',durationMs:8250,metadataKey:key,hasMedia:true}]});
+    const numericMetadata=normalizeExportMetadata({organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z',durationMs:0,mediaType:'voice'},key,config);
+    expect(numericMetadata?.durationSeconds).toBe(0);
+    expect(normalizeExportMetadata({conversationId:'conv-1',recordingId:'recording-1',mediaType:'chat',startTime:'2026-11-23T10:14:00.000Z'},key,config)).toBeUndefined();
+    expect(normalizeExportMetadata({conversationId:'conv-1',recordingId:'recording-1',mediaType:'recording',startTime:'2026-11-23T10:14:00.000Z'},key,config)).toMatchObject({recordingCount:1});
+    expect(normalizeExportMetadata({conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z'},'outside/recording-1_metadata.json',config)).toBeUndefined();
+    expect(normalizeExportMetadata({organizationId:'other-org',conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z'},key,config)).toBeUndefined();
+    expect(normalizeExportMetadata({organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z'},'exports/org-123/year=2026/month=11/day=22/hour=10/conversation_id=conv-1/recording-1_metadata.json',config)).toBeUndefined();
+    expect(normalizeExportMetadata({organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z'},'exports/org-123/year=2026/month=11/day=32/hour=10/conversation_id=conv-1/recording-1_metadata.json',config)).toBeUndefined();
+    expect(normalizeExportMetadata({organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z'},'exports/org-123/year=2026/month=11/day=23/hour=10/conversation_id=another-conversation/recording-1_metadata.json',config)).toBeUndefined();
+  });
+
+  it('discovers screen recordings without weakening voice verification or leaking media URIs',async()=>{
+    const signed='https://media.usw2.pure.cloud/secure?token=never-expose',conversation={participants:[{sessions:[{mediaType:'voice'}]}]},client={async get<T>(){return [{id:'voice-1',media:'audio',mediaType:'voice',mediaUris:{WEBM:{mediaUri:signed}}},{id:'screen-1',mediaType:'screenRecording',mediaUris:{WEBM:{mediaUri:signed}}},{id:'chat-1',mediaType:'chat',mediaUris:{WEBM:{mediaUri:signed}}}] as T;}};
+    const items=await listConversationRecordings(client,'conversation'),playable=listPlayableRecordings(items,conversation);
+    expect(playable.map(item=>item.id)).toEqual(['voice-1','screen-1']);
+    expect(isScreenRecording(items[1])).toBe(true);
+    const publicRows=playable.map(item=>safeRecordingMetadata(item,conversation));
+    expect(JSON.stringify(publicRows)).not.toContain('mediaUri');
+    expect(JSON.stringify(publicRows)).not.toContain('never-expose');
+  });
+
+  it('extracts several validated WebM monitor tracks and rejects unsafe or tampered ZIPs',()=>{
+    const first=Buffer.from([0x1a,0x45,0xdf,0xa3,1,2]),second=Buffer.from([0x1a,0x45,0xdf,0xa3,3,4]);
+    const tracks=extractScreenTracksFromZip(makeZip([{name:'screenRecordingId/Monitor 1.webm',data:first},{name:'screenRecordingId/Monitor 2.webm',data:second},{name:'readme.txt',data:Buffer.from('ignored')} ]));
+    expect(tracks.map(track=>track.name)).toEqual(['Monitor 1.webm','Monitor 2.webm']);expect(tracks.map(track=>track.bytes)).toEqual([first,second]);
+    expect(tracksFromBytes(makeZip([{name:'Monitor.webm',data:first}]))).toHaveLength(1);
+    expect(screenTrackFromWebm(first).mimeType).toBe('video/webm');
+    expect(()=>extractScreenTracksFromZip(makeZip([{name:'../secret.webm',data:first}]))).toThrow(/unsafe file name/);
+    const corrupt=makeZip([{name:'Monitor.webm',data:first}]);corrupt[31]^=1;expect(()=>extractScreenTracksFromZip(corrupt)).toThrow();
+    expect(()=>screenTrackFromWebm(Buffer.from('not WebM'))).toThrow(/not a supported WebM/);
+  });
+
+  it('scopes temporary screen playback cache entries to the authenticated owner',()=>{
+    const track=screenTrackFromWebm(Buffer.from([0x1a,0x45,0xdf,0xa3,1]),'monitor.webm'),id=cacheScreenTracks('user-a',[track]);
+    expect(id).toBeTruthy();expect(getCachedScreenTrack(id!,'user-a','0')?.name).toBe('monitor.webm');expect(getCachedScreenTrack(id!,'user-b','0')).toBeUndefined();
+  });
+
+  it('supports region-valid AWS S3 buckets that contain adjacent dots',()=>{
+    expect(s3SourceSchema.safeParse({name:'S3',bucket:'a.b-recordings',region:'ap-southeast-1',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'}).success).toBe(true);
+    expect(s3SourceSchema.safeParse({name:'S3',bucket:'ab..cd',region:'ap-southeast-1',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'}).success).toBe(false);
+    expect(s3SourceSchema.safeParse({name:'S3',bucket:'999.1.1.1',region:'ap-southeast-1',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'}).success).toBe(false);
+  });
+
+  it('searches only configured organization metadata and applies exported metadata filters',async()=>{
+    const parsed=s3SourceSchema.parse({name:'Archive',bucket:'mfec-genesys-exports',region:'ap-southeast-1',prefix:'exports',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'});
+    const config={...parsed,accessKeyId:parsed.accessKeyId!,secretAccessKey:parsed.secretAccessKey!};
+    const key='exports/org-123/year=2026/month=11/day=23/hour=10/conversation_id=conv-1/recording-1_metadata.json';
+    const metadata={organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z',mediaType:'voice',agents:['Nicha S.'],queueNames:['Customer Care'],ani:'+6620000000'};
+    const requests:any[]=[];
+    const client={send:async(command:any)=>{requests.push(command.input);if(command.constructor.name==='ListObjectsV2Command')return {Contents:[{Key:key,Size:JSON.stringify(metadata).length}]};if(command.constructor.name==='GetObjectCommand')return {Body:Readable.from([Buffer.from(JSON.stringify(metadata))])};throw new Error('Unexpected S3 command.');},destroy(){}};
+    const result=await searchS3Recordings(config,{start:'2026-11-23T00:00:00.000Z',end:'2026-11-24T00:00:00.000Z',agentName:'nicha',queueName:'care',phone:'+6620000000',pageNumber:1,pageSize:25},()=>client as any);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]).toMatchObject({conversationId:'conv-1',agents:['Nicha S.'],queues:['Customer Care']});
+    expect(requests[0].Prefix).toBe('exports/org-123/year=2026/month=11/day=23/');
+  });
+
+  it('retrieves only a requested AWS S3 audio byte range and reports range headers',async()=>{
+    const parsed=s3SourceSchema.parse({name:'Archive',bucket:'mfec-genesys-exports',region:'ap-southeast-1',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'});
+    const config={...parsed,accessKeyId:parsed.accessKeyId!,secretAccessKey:parsed.secretAccessKey!},requests:any[]=[];
+    const client={send:async(command:any)=>{requests.push(command.input);if(command.constructor.name==='HeadObjectCommand')return {ContentLength:10,ContentType:'audio/ogg'};return {Body:Readable.from([Buffer.from('234')]),ContentLength:3,ContentRange:'bytes 2-4/10'};},destroy(){}};
+    const result=await getS3RecordingAudio(config,'org-123/year=2026/month=11/day=23/hour=10/conversation_id=conv-1/recording-1.opus','bytes=2-4',()=>client as any);
+    expect('invalidRange' in result).toBe(false);
+    if(!('invalidRange' in result)){
+      expect(result.status).toBe(206);
+      expect(result.range).toBe('bytes 2-4/10');
+      expect(result.contentType).toBe('audio/ogg');
+      expect(requests[1].Range).toBe('bytes=2-4');
+      const chunks:Buffer[]=[];for await(const chunk of result.body as AsyncIterable<Uint8Array>)chunks.push(Buffer.from(chunk));
+      expect(Buffer.concat(chunks)).toEqual(Buffer.from('234'));
+      result.close();
+    }
+  });
+
+  it('loads a bounded transcript via validated Genesys transcript storage URLs',async()=>{
+    const connection={api_base_url:'https://api.usw2.pure.cloud'},conversation={conversationId:'conversation-1',participants:[{sessions:[{mediaType:'voice',sessionId:'communication-1'}]}]},client={post:async()=>({}),get:async(path:string)=>path.includes('transcripturl')?{url:'https://transcripts.s3.amazonaws.com/transcript.json?X-Amz-Signature=sig&X-Amz-Credential=credential&X-Amz-Date=20261118T000000Z&X-Amz-Expires=600'}:{}};
+    const transcript=await fetchConversationTranscriptions(client as any,connection,'conversation-1',conversation,async()=>new Response(JSON.stringify({utterances:[{text:'hello'}]}),{status:200,headers:{'content-type':'application/json'}}));
+    expect(transcript).toEqual([{communicationId:'communication-1',transcript:{utterances:[{text:'hello'}]}}]);
+  });
 
   it('parses valid, suffix, clamped and unsatisfiable audio byte ranges', () => {
     expect(parseByteRange(undefined, 10)).toBeUndefined();

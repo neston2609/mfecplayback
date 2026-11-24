@@ -2,6 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
@@ -48,6 +49,11 @@ async function request(route: string, init: RequestInit = {}, useCsrf = false) {
   return fetch(`${baseUrl}${route}`, { ...init, headers });
 }
 
+async function requestAs(route:string,sessionCookie:string,init:RequestInit={}){
+  const headers=new Headers(init.headers);headers.set('Cookie',sessionCookie);
+  return fetch(`${baseUrl}${route}`,{...init,headers});
+}
+
 describe('HTTP API security and Mock Mode flows', () => {
   beforeAll(async () => {
     testDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'mfec-recording-explorer-test-'));
@@ -65,9 +71,9 @@ describe('HTTP API security and Mock Mode flows', () => {
         APP_ORIGIN: 'http://localhost:5173', TRUST_PROXY: 'false', MOCK_MODE: 'true',
         SESSION_SECRET: 'integration-test-session-secret-with-sufficient-entropy',
         ...(process.env.FFMPEG_PATH ? { FFMPEG_PATH: process.env.FFMPEG_PATH } : {}),
-        MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 17).toString('base64'),
         DATABASE_PATH: integrationDatabasePath=path.join(testDirectory, 'integration.sqlite'),
         LIBRARY_STORAGE_ROOT: path.join(testDirectory,'library-storage'),
+        MASTER_ENCRYPTION_KEY: Buffer.alloc(32,17).toString('base64'),
         INITIAL_ADMIN_USERNAME: 'integration-admin', INITIAL_ADMIN_PASSWORD: 'Integration-Test-Password-456!',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -131,7 +137,9 @@ describe('HTTP API security and Mock Mode flows', () => {
 
     const destinations=await request('/api/library/destinations');
     expect(destinations.status).toBe(200);
-    expect(await destinations.json()).toMatchObject({destinations:[],recordingOutputFormat:'m4a'});
+    expect(await destinations.json()).toMatchObject({destinations:[],defaultDestinationId:'',recordingOutputFormat:'m4a'});
+    expect(await (await request('/api/library/destination-options')).json()).toMatchObject({destinations:[],defaultDestinationId:''});
+    expect((await request('/api/library/destinations/default',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({destinationId:'missing-destination'})})).status).toBe(403);
     const recordingFormat=await request('/api/library/recording-format');
     expect(recordingFormat.status).toBe(200);
     const recordingFormatInfo=await recordingFormat.json() as {format:string;formats:string[];conversionAvailable:boolean};
@@ -168,12 +176,15 @@ describe('HTTP API security and Mock Mode flows', () => {
     const savedDestinationBody=await savedDestination.json() as {destination:Record<string,unknown>};
     expect(savedDestinationBody.destination).toMatchObject({name:'Integration archive',type:'local',retentionDays:30});
     expect(savedDestinationBody.destination).not.toHaveProperty('password');
+    expect((await request('/api/library/destinations/default',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({destinationId:savedDestinationBody.destination.id})},true)).status).toBe(200);
+    expect(await (await request('/api/library/destinations')).json()).toMatchObject({defaultDestinationId:savedDestinationBody.destination.id});
+    expect(await (await request('/api/library/destination-options')).json()).toMatchObject({defaultDestinationId:savedDestinationBody.destination.id,destinations:[{id:savedDestinationBody.destination.id,name:'Integration archive'}]});
     const archivedId='00000000-0000-4000-8000-000000000021',rangeAudio=Buffer.from('0123456789'),relativeAudio='range-test/fixture.m4a',audioNow=new Date().toISOString();
     await fs.mkdir(path.join(testDirectory,'library-storage','range-test'),{recursive:true});
     await fs.writeFile(path.join(testDirectory,'library-storage',relativeAudio),rangeAudio);
     const archiveDb=new Database(integrationDatabasePath);
     archiveDb.prepare("INSERT INTO archived_recordings(id,connection_id,conversation_id,recording_id,destination_id,relative_path,file_name,mime_type,size_bytes,sha256,conversation_start,metadata_json,archived_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-      .run(archivedId,'range-test-connection','range-test-conversation','range-test-recording',savedDestinationBody.destination.id,relativeAudio,'fixture.m4a','audio/mp4',rangeAudio.length,'test-sha256',audioNow,'{}',audioNow,new Date(Date.now()+86400000).toISOString());
+      .run(archivedId,'range-test-connection','range-test-conversation','range-test-recording',savedDestinationBody.destination.id,relativeAudio,'fixture.m4a','audio/mp4',rangeAudio.length,'test-sha256',audioNow,JSON.stringify({conversation:{wrapUpCodes:['Resolved'],wrapUpNotes:[]},transcriptions:[{communicationId:'fixture-communication',transcript:{utterances:[]}}]}),audioNow,new Date(Date.now()+86400000).toISOString());
     archiveDb.prepare("UPDATE archived_recordings SET direction='inbound',ani='+66812345678',dnis='+6621112222' WHERE id=?").run(archivedId);
     archiveDb.prepare('INSERT INTO connections(id,name,organization_label,region_id,api_base_url,oauth_base_url,client_id,client_secret_enc,enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,0,?,?)').run('00000000-0000-4000-8000-000000000031','rearchive mock connection','test','us-east-1','https://api.mypurecloud.com','https://login.mypurecloud.com','test-client','',audioNow,audioNow);
     archiveDb.prepare("UPDATE archived_recordings SET connection_id='00000000-0000-4000-8000-000000000031' WHERE id=?").run(archivedId);
@@ -182,6 +193,15 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(archiveMark.status).toBe(200);
     expect(await (await request('/api/library')).json()).toMatchObject({items:[],total:0});
     expect(await (await request('/api/library?showUnplayable=true')).json()).toMatchObject({items:[{id:archivedId,unplayable:true}],total:1});
+    expect(await (await request('/api/library?q=range-test-conversation&showUnplayable=true')).json()).toMatchObject({items:[{id:archivedId}],total:1});
+    expect(await (await request('/api/library?conversationId=other-conversation&showUnplayable=true')).json()).toMatchObject({items:[],total:0});
+    expect(await (await request('/api/library?direction=inbound&dnis=662111&showUnplayable=true')).json()).toMatchObject({items:[{id:archivedId}],total:1});
+    expect(await (await request(`/api/library?destinationId=${savedDestinationBody.destination.id}&showUnplayable=true`)).json()).toMatchObject({items:[{id:archivedId}],total:1});
+    expect(await (await request('/api/library?destinationId=other-destination&showUnplayable=true')).json()).toMatchObject({items:[],total:0});
+    expect(await (await request('/api/library?direction=outbound&showUnplayable=true')).json()).toMatchObject({items:[],total:0});
+    expect(await (await request('/api/library?agentName=Example+Agent&queueName=Support&showUnplayable=true')).json()).toMatchObject({items:[],total:0});
+    expect((await request('/api/library?start=not-a-date')).status).toBe(400);
+    expect((await request('/api/library/metadata-backfill/retry',{method:'POST',headers:{'content-type':'application/json'},body:'{}'})).status).toBe(403);
     const archiveUnmark=await request('/api/recordings/playability',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({connectionId:'00000000-0000-4000-8000-000000000031',conversationId:'range-test-conversation',recordingId:'range-test-recording',unplayable:false,source:'archive',archiveId:archivedId})},true);
     expect(archiveUnmark.status).toBe(200);
     const rangedAudio=await request(`/api/library/${archivedId}/audio`,{headers:{Range:'bytes=2-5'}});
@@ -255,11 +275,39 @@ describe('HTTP API security and Mock Mode flows', () => {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
     });
     expect(noCsrfConnectionTest.status).toBe(403);
+    const noCsrfS3Test=await request('/api/s3/sources/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})});
+    expect(noCsrfS3Test.status).toBe(403);
     const mockConnectionTest = await request('/api/genesys/connections/test', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
     }, true);
     expect(mockConnectionTest.status).toBe(409);
     expect((await mockConnectionTest.json() as { error: string }).error).toMatch(/Mock Mode/i);
+    const s3Sources=await request('/api/s3/sources');
+    expect(s3Sources.status).toBe(200);
+    expect(await s3Sources.json()).toEqual({sources:[]});
+    expect((await request('/api/s3/sources/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).status).toBe(403);
+    expect((await request('/api/recordings/not-real/stream?connectionId=s3:missing&conversationId=conv&metadataKey=org/year=2026/month=11/day=23/hour=01/conversation_id=conv/recording_metadata.json')).status).toBe(404);
+    expect((await request('/api/recordings/not-real/download?connectionId=s3:missing&conversationId=conv&metadataKey=org/year=2026/month=11/day=23/hour=01/conversation_id=conv/recording_metadata.json')).status).toBe(404);
+
+    const s3AuthorizationDb=new Database(integrationDatabasePath),s3SourceId='00000000-0000-4000-8000-000000000041',s3ConnectionId='00000000-0000-4000-8000-000000000031',viewerId='integration-viewer-id',sourceNow=new Date().toISOString();
+    const fixtureEncrypt=(plain:string)=>{const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',Buffer.alloc(32,17),iv),data=Buffer.concat([cipher.update(plain,'utf8'),cipher.final()]);return `${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${data.toString('base64')}`;};
+    s3AuthorizationDb.prepare('INSERT INTO s3_sources(id,name,bucket,region,prefix,organization_id,genesys_connection_id,access_key_id_enc,secret_access_key_enc,session_token_enc,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)').run(s3SourceId,'Grant test source','integration-recordings','ap-southeast-1','', 'integration-org',s3ConnectionId,fixtureEncrypt('integration-access-key'),fixtureEncrypt('integration-secret-key'),'',sourceNow,sourceNow);
+    s3AuthorizationDb.prepare('INSERT INTO users(id,username,password_hash,role,enabled,created_at,access_role_id) VALUES(?,?,?,?,1,?,?)').run(viewerId,'s3-authorization-viewer',bcrypt.hashSync('S3-Authorization-Password-456!',4),'viewer',sourceNow,'viewer');
+    s3AuthorizationDb.close();
+    const viewerLogin=await fetch(`${baseUrl}/api/auth/login`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:'s3-authorization-viewer',password:'S3-Authorization-Password-456!'})});
+    expect(viewerLogin.status).toBe(200);
+    const viewerCookie=(viewerLogin.headers.get('set-cookie')||'').split(';',1)[0];
+    expect(await (await requestAs('/api/s3/sources',viewerCookie)).json()).toEqual({sources:[]});
+    const sourceQuery=`connectionId=s3:${s3SourceId}&conversationId=authorization-conversation&metadataKey=integration-org/year=2026/month=11/day=23/hour=01/conversation_id=authorization-conversation/recording_metadata.json`;
+    expect((await requestAs(`/api/recordings/authorization-recording/stream?${sourceQuery}`,viewerCookie)).status).toBe(404);
+    const grantDb=new Database(integrationDatabasePath);
+    grantDb.prepare('INSERT INTO user_connection_access(user_id,connection_id) VALUES(?,?)').run(viewerId,s3ConnectionId);
+    grantDb.close();
+    expect((await (await requestAs('/api/s3/sources',viewerCookie)).json() as {sources:{id:string}[]}).sources).toMatchObject([{id:s3SourceId}]);
+    const authorizedPlayback=await requestAs(`/api/recordings/authorization-recording/stream?${sourceQuery}`,viewerCookie);
+    expect(authorizedPlayback.status,await authorizedPlayback.clone().text()).toBe(409);
+    expect((await requestAs(`/api/recordings/authorization-recording/download?${sourceQuery}`,viewerCookie)).status).toBe(403);
+    expect((await requestAs(`/api/recordings/conversations/authorization-conversation/screens?${sourceQuery}&recordingId=authorization-recording`,viewerCookie)).status).toBe(409);
 
     const search = await request('/api/recordings/search', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -335,6 +383,30 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(allConversations.results).toHaveLength(3);
     expect(allConversations.results.every(row => row.recordingCount > 0)).toBe(true);
     expect(allConversations.results.flatMap(row=>row.recordings).every(recording=>recording.mediaType==='voice')).toBe(true);
+
+    const screenArchiveId='00000000-0000-4000-8000-000000000051',screenBytes=Buffer.from([0x1a,0x45,0xdf,0xa3,0x01,0x02,0x03]),screenPath='screen-test/monitor.webm',screenNow=new Date().toISOString();
+    await fs.mkdir(path.join(testDirectory,'library-storage','screen-test'),{recursive:true});
+    await fs.writeFile(path.join(testDirectory,'library-storage',screenPath),screenBytes);
+    const screenDb=new Database(integrationDatabasePath);
+    screenDb.prepare("INSERT INTO archived_recordings(id,connection_id,conversation_id,recording_id,destination_id,relative_path,file_name,mime_type,media_type,size_bytes,sha256,conversation_start,metadata_json,archived_at,expires_at) VALUES(?,?,?,?,?,?,?,'video/webm','screen',?,?,?, ?,?,?)").run(screenArchiveId,'screen-no-access-connection','screen-test-conversation','screen-test-recording',savedDestinationBody.destination.id,screenPath,'monitor.webm',screenBytes.length,'screen-fixture-sha256',screenNow,JSON.stringify({conversationId:'screen-test-conversation'}),screenNow,new Date(Date.now()+86400000).toISOString());
+    screenDb.close();
+    const screenLookup=await request(`/api/library/${screenArchiveId}/screens`);
+    expect(screenLookup.status).toBe(200);
+    const screenLookupBody=await screenLookup.json() as {tracks:{url:string;mimeType:string;name:string}[]};
+    expect(screenLookupBody.tracks).toHaveLength(1);
+    expect(screenLookupBody.tracks[0]).toMatchObject({mimeType:'video/webm',name:'monitor.webm · monitor.webm'});
+    const deniedScreenLookup=await requestAs(`/api/library/${screenArchiveId}/screens`,viewerCookie);
+    expect(deniedScreenLookup.status).toBe(403);
+    expect((await requestAs(screenLookupBody.tracks[0].url,viewerCookie)).status).toBe(403);
+    const screenStream=await request(screenLookupBody.tracks[0].url);
+    expect(screenStream.status).toBe(200);
+    expect(screenStream.headers.get('content-type')).toMatch(/video\/webm/i);
+    expect(Buffer.from(await screenStream.arrayBuffer())).toEqual(screenBytes);
+    expect((await request('/api/library/00000000-0000-4000-8000-000000000051/screens/unknown/stream')).status).toBe(404);
+    const cleanupAuthorizationDb=new Database(integrationDatabasePath);
+    cleanupAuthorizationDb.prepare('DELETE FROM s3_sources WHERE id=?').run(s3SourceId);
+    cleanupAuthorizationDb.prepare('DELETE FROM users WHERE id=?').run(viewerId);
+    cleanupAuthorizationDb.close();
   }, 30_000);
 
   it('lists saved live connections after trusted-region validation without exposing endpoint or secret fields', async () => {
@@ -610,8 +682,12 @@ describe('HTTP API security and Mock Mode flows', () => {
     const viewerAuth = await viewerLogin.json() as { csrfToken: string };
     const viewerAudioDownload=await fetch(`${baseUrl}/api/recordings/demo-recording-1/download?connectionId=mock&conversationId=demo-ava-agent-001`,{headers:{Cookie:viewerCookie}});
     expect(viewerAudioDownload.status).toBe(403);
-    const viewerHistory=await (await fetch(`${baseUrl}/api/playback-history`,{headers:{Cookie:viewerCookie}})).json() as {total:number;page:number;pageSize:number;totalPages:number};
-    expect(viewerHistory).toMatchObject({total:0,page:1,pageSize:15,totalPages:1});
+    const viewerS3Playback=await fetch(`${baseUrl}/api/recordings/not-real/stream?connectionId=s3:missing&conversationId=conv&metadataKey=org/year=2026/month=11/day=23/hour=01/conversation_id=conv/recording_metadata.json`,{headers:{Cookie:viewerCookie}});
+    expect(viewerS3Playback.status).toBe(404);
+    const viewerS3Download=await fetch(`${baseUrl}/api/recordings/not-real/download?connectionId=s3:missing&conversationId=conv&metadataKey=org/year=2026/month=11/day=23/hour=01/conversation_id=conv/recording_metadata.json`,{headers:{Cookie:viewerCookie}});
+    expect(viewerS3Download.status).toBe(403);
+    const viewerHistory=await (await fetch(`${baseUrl}/api/playback-history`,{headers:{Cookie:viewerCookie}})).json() as {total:number;page:number;pageSize:number;totalPages:number;items:{action:string;result:string}[]};
+    expect(viewerHistory).toMatchObject({total:1,page:1,pageSize:15,totalPages:1,items:[{action:'PLAYBACK',result:'FAILED'}]});
     const viewerAdminPage = await fetch(`${baseUrl}/api/admin/users`, { headers: { Cookie: viewerCookie } });
     expect(viewerAdminPage.status).toBe(403);
     const roleRename=await request(`/api/admin/roles/${archiveRole.role.id}`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Archive Reader',permissions:{realtimePlayback:false,realtimeDownload:false,libraryPlayback:true,libraryAdmin:false}})},true);
@@ -623,8 +699,10 @@ describe('HTTP API security and Mock Mode flows', () => {
     const archiveCookie=(archiveLogin.headers.get('set-cookie')||'').split(';',1)[0];
     const archiveAuth=await archiveLogin.json() as {user:{role:string;permissions:{libraryPlayback:boolean;realtimePlayback:boolean};};csrfToken:string};
     expect(archiveAuth.user).toMatchObject({role:archiveRole.role.id,permissions:{libraryPlayback:true,realtimePlayback:false}});
+    expect((await fetch(`${baseUrl}/api/s3/sources`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
     expect((await fetch(`${baseUrl}/api/library`,{headers:{Cookie:archiveCookie}})).status).toBe(200);
     expect((await fetch(`${baseUrl}/api/library/destinations`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
+    expect((await fetch(`${baseUrl}/api/library/destination-options`,{headers:{Cookie:archiveCookie}})).status).toBe(200);
     expect((await fetch(`${baseUrl}/api/library/schedules`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
     expect((await fetch(`${baseUrl}/api/library/worker-status`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
     expect((await fetch(`${baseUrl}/api/recordings/conversations/demo-ava-agent-001?connectionId=mock`,{headers:{Cookie:archiveCookie}})).status).toBe(403);
@@ -641,6 +719,7 @@ describe('HTTP API security and Mock Mode flows', () => {
     expect(archiveAdminAuth.user.permissions).toMatchObject({libraryPlayback:true,libraryAdmin:true,realtimePlayback:false});
     expect((await fetch(`${baseUrl}/api/library/schedules`,{headers:{Cookie:archiveAdminCookie}})).status).toBe(200);
     expect((await fetch(`${baseUrl}/api/library/destinations`,{headers:{Cookie:archiveAdminCookie}})).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/library/destinations/default`,{method:'PUT',headers:{'content-type':'application/json',Cookie:archiveAdminCookie,'x-csrf-token':archiveAdminAuth.csrfToken,Origin:'http://localhost:5173'},body:JSON.stringify({destinationId:''})})).status).toBe(200);
     expect((await fetch(`${baseUrl}/api/recordings/search`,{method:'POST',headers:{'content-type':'application/json',Cookie:archiveAdminCookie,'x-csrf-token':archiveAdminAuth.csrfToken,Origin:'http://localhost:5173'},body:JSON.stringify({connectionId:'mock',intervalStart:'2026-10-01T00:00:00.000Z',intervalEnd:'2026-10-02T00:00:00.000Z'})})).status).toBe(403);
     expect((await fetch(`${baseUrl}/api/genesys/connections`,{headers:{Cookie:archiveAdminCookie}})).status).toBe(200);
     expect((await fetch(`${baseUrl}/api/genesys/directory?connectionId=mock&type=agent&q=Ni`,{headers:{Cookie:archiveAdminCookie}})).status).toBe(403);

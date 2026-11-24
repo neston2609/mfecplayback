@@ -18,6 +18,20 @@ export function isVoiceInteraction(conversation: any): boolean {
 }
 
 export async function listVoiceRecordings(client: RecordingMetadataClient, conversationId: string, conversation?: any) {
+  const items=await listConversationRecordings(client,conversationId);
+  const ids = new Set<string>();
+  return items.filter((recording: any) => {
+    const id = String(recording?.id || recording?.recordingId || '');
+    const hasUnspecifiedMediaType=!recording?.mediaType&&!recording?.media;
+    const verifiedVoice=isVoiceRecording(recording,conversation)||(hasUnspecifiedMediaType&&isVoiceInteraction(conversation));
+    if (!id || ids.has(id) || isMessageRecording(recording) || !verifiedVoice) return false;
+    ids.add(id);
+    return true;
+  });
+}
+
+/** Fetch recording metadata without dropping screen recordings. Keep media URLs server-side. */
+export async function listConversationRecordings(client: RecordingMetadataClient, conversationId: string) {
   let items: any[] = [];
   try {
     const response = await client.get<any>(recordingMetadataRequestPath(conversationId));
@@ -36,16 +50,16 @@ export async function listVoiceRecordings(client: RecordingMetadataClient, conve
       : Array.isArray(response?.recordingMetadata) ? response.recordingMetadata
       : Array.isArray(response?.entities) ? response.entities : [];
   }
-  const ids = new Set<string>();
-  return items.filter((recording: any) => {
-    const id = String(recording?.id || recording?.recordingId || '');
-    const hasUnspecifiedMediaType=!recording?.mediaType&&!recording?.media;
-    const verifiedVoice=isVoiceRecording(recording,conversation)||(hasUnspecifiedMediaType&&isVoiceInteraction(conversation));
-    if (!id || ids.has(id) || isMessageRecording(recording) || !verifiedVoice) return false;
-    ids.add(id);
-    return true;
-  });
+  const ids=new Set<string>();
+  return items.filter((recording:any)=>{const id=String(recording?.id||recording?.recordingId||'');if(!id||ids.has(id)||isMessageRecording(recording))return false;ids.add(id);return true;});
 }
+
+export function isScreenRecording(recording:any):boolean{
+  const type=String(recording?.mediaType||recording?.media_type||'').trim().toLowerCase(),subtype=String(recording?.mediaSubtype||recording?.mediaSubType||recording?.media_subtype||'').trim().toLowerCase(),media=String(recording?.media||'').trim().toLowerCase();
+  return /screen/.test(type)||/screen/.test(subtype)||/screen/.test(media);
+}
+
+export function listPlayableRecordings(items:any[],conversation?:any){return items.filter(item=>!isMessageRecording(item)&&(isScreenRecording(item)||isVoiceRecording(item,conversation)));}
 
 export function recordingMediaUri(metadata: any, formatId?: string, strict = false, assumeRequestedFormat = false): string | undefined {
   const mediaUris = metadata?.mediaUris;
@@ -113,8 +127,8 @@ export function isZipMediaContentType(contentType: string | null | undefined): b
 
 export function isMessageRecording(metadata: any): boolean {
   const media = typeof metadata?.media === 'string' ? metadata.media.trim().toLowerCase() : '';
-  const mediaType = typeof metadata?.mediaType === 'string' ? metadata.mediaType.trim().toLowerCase() : '';
-  return ['message', 'chat', 'email'].includes(media) || ['message', 'chat', 'email'].includes(mediaType);
+  const mediaTypes=[metadata?.mediaType,metadata?.mediaSubtype,metadata?.mediaSubType,metadata?.media_type,metadata?.media_subtype].filter((value):value is string=>typeof value==='string').map(value=>value.trim().toLowerCase());
+  return ['message', 'chat', 'email'].includes(media) || mediaTypes.some(value=>['message','chat','email'].includes(value));
 }
 
 export function conversationHasVoiceSession(conversation: any): boolean {
@@ -127,7 +141,7 @@ export function conversationHasVoiceSession(conversation: any): boolean {
 
 export function isVoiceRecording(recording: any, conversation?: any): boolean {
   if (isMessageRecording(recording)) return false;
-  const mediaType = typeof recording?.mediaType === 'string' ? recording.mediaType.trim().toLowerCase() : '';
+  const mediaType = String(recording?.mediaType||recording?.media_type||recording?.mediaSubtype||recording?.mediaSubType||recording?.media_subtype||'').trim().toLowerCase();
   const media = typeof recording?.media === 'string' ? recording.media.trim().toLowerCase() : '';
   if (mediaType === 'voice') return true;
   // Genesys may report callback recordings as `mediaType: callback`, while the
@@ -138,6 +152,13 @@ export function isVoiceRecording(recording: any, conversation?: any): boolean {
   // Legacy recording metadata omits mediaType; use its audio media class and
   // conversation context (voice or callback) rather than dropping the item.
   return media === 'audio' && conversationHasVoiceSession(conversation);
+}
+
+/** Project Genesys metadata into a browser-safe recording shape; never return signed media links. */
+export function safeRecordingMetadata(recording:any,conversation?:any){
+  const mediaUris=recording?.mediaUris,mediaUriAvailable=(Array.isArray(mediaUris)&&mediaUris.some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||(mediaUris&&typeof mediaUris==='object'&&!Array.isArray(mediaUris)&&Object.values(mediaUris).some((entry:any)=>typeof entry?.mediaUri==='string'&&entry.mediaUri))||typeof recording?.mediaUri==='string'&&recording.mediaUri;
+  const mediaType=recording?.mediaType||recording?.media_type||recording?.mediaSubtype||recording?.mediaSubType||recording?.media_subtype||(recording?.media==='audio'&&conversationHasVoiceSession(conversation)?'voice':undefined);
+  return {id:recording?.id||recording?.recordingId,startTime:recording?.startTime||recording?.recordingStartTime,endTime:recording?.endTime||recording?.recordingEndTime,status:recording?.status||recording?.recordingState||recording?.fileState||'UNKNOWN',media:recording?.media,mediaType,durationMs:recording?.durationMs||recording?.outputDurationMs,hasMedia:Boolean(mediaUriAvailable)};
 }
 
 export async function getRecordingMedia(
