@@ -521,11 +521,18 @@ app.delete('/api/admin/users/:id',requireAuth,requireAdmin,requireCsrf,(req,res,
 app.get('/api/genesys/directory',requireAuth,requireRecordingSearch,rateLimit({windowMs:60*1000,limit:60,standardHeaders:'draft-7',legacyHeaders:false}),async(req,res,next)=>{
   try{
     const input=z.object({connectionId:z.string().min(1),type:z.enum(['agent','group','queue']),q:z.string().trim().min(2).max(120)}).parse(req.query);
-    if(input.connectionId==='mock'&&process.env.MOCK_MODE==='true'){
+    let connectionId=input.connectionId;
+    if(connectionId.startsWith('s3:')){
+      const sourceId=connectionId.slice(3),source=db.prepare('SELECT * FROM s3_sources WHERE id=? AND enabled=1').get(sourceId) as S3SourceRow|undefined;
+      if(!source||!canUseS3Source(source,req.session.user!.id,req.session.user!.role))throw httpError(404,'AWS S3 source not found or access denied.');
+      if(!source.genesys_connection_id)throw httpError(404,'AWS S3 source is not linked to a Genesys Connection.');
+      connectionId=source.genesys_connection_id;
+    }
+    if(connectionId==='mock'&&process.env.MOCK_MODE==='true'){
       const needle=input.q.toLocaleLowerCase();
       return res.json({suggestions:MOCK_DIRECTORY[input.type].filter(item=>item.name.toLocaleLowerCase().includes(needle)).sort((a,b)=>Number(!a.name.toLocaleLowerCase().startsWith(needle))-Number(!b.name.toLocaleLowerCase().startsWith(needle))||a.name.localeCompare(b.name)).slice(0,10)});
     }
-    const connection=connectionById(input.connectionId,req.session.user!.id,req.session.user!.role),client=new GenesysClient(connection);
+    const connection=connectionById(connectionId,req.session.user!.id,req.session.user!.role),client=new GenesysClient(connection);
     res.setHeader('Cache-Control','private, max-age=30');
     res.json({suggestions:await searchDirectory(client,input.type,input.q)});
   }catch(error){next(error);}

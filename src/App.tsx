@@ -102,7 +102,7 @@ function DirectoryAutocomplete({type,label,placeholder,value,connectionId,csrf,o
   useEffect(()=>{
     let current=true;
     if(selectedName&&value===selectedName){setOpen(false);return()=>{current=false;};}
-    if(connectionId.startsWith('s3:')||value.trim().length<2){onOptions([]);return()=>{current=false;};}
+     if(value.trim().length<2){onOptions([]);return()=>{current=false;};}
     const timer=window.setTimeout(()=>{
       api<{suggestions:DirectorySuggestion[]}>(`/api/genesys/directory?connectionId=${encodeURIComponent(connectionId)}&type=${type}&q=${encodeURIComponent(value.trim())}`)
         .then(result=>{if(current){onOptions(result.suggestions);setOpen(true);setActive(-1);}})

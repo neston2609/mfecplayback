@@ -299,11 +299,15 @@ describe('HTTP API security and Mock Mode flows', () => {
     const viewerCookie=(viewerLogin.headers.get('set-cookie')||'').split(';',1)[0];
     expect(await (await requestAs('/api/s3/sources',viewerCookie)).json()).toEqual({sources:[]});
     const sourceQuery=`connectionId=s3:${s3SourceId}&conversationId=authorization-conversation&metadataKey=integration-org/year=2026/month=11/day=23/hour=01/conversation_id=authorization-conversation/recording_metadata.json`;
+    const ungrantedDirectorySuggestion=await requestAs(`/api/genesys/directory?connectionId=s3:${s3SourceId}&type=agent&q=Nicha`,viewerCookie);
+    expect(ungrantedDirectorySuggestion.status).toBe(404);
     expect((await requestAs(`/api/recordings/authorization-recording/stream?${sourceQuery}`,viewerCookie)).status).toBe(404);
     const grantDb=new Database(integrationDatabasePath);
     grantDb.prepare('INSERT INTO user_connection_access(user_id,connection_id) VALUES(?,?)').run(viewerId,s3ConnectionId);
     grantDb.close();
     expect((await (await requestAs('/api/s3/sources',viewerCookie)).json() as {sources:{id:string}[]}).sources).toMatchObject([{id:s3SourceId}]);
+    const s3DirectorySuggestion=await requestAs(`/api/genesys/directory?connectionId=s3:${s3SourceId}&type=agent&q=Nicha`,viewerCookie);
+    expect(s3DirectorySuggestion.status,await s3DirectorySuggestion.clone().text()).toBe(409);
     const authorizedPlayback=await requestAs(`/api/recordings/authorization-recording/stream?${sourceQuery}`,viewerCookie);
     expect(authorizedPlayback.status,await authorizedPlayback.clone().text()).toBe(409);
     expect((await requestAs(`/api/recordings/authorization-recording/download?${sourceQuery}`,viewerCookie)).status).toBe(403);
