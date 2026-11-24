@@ -74,6 +74,14 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(normalizeExportMetadata({organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',startTime:'2026-11-23T10:14:00.000Z'},'exports/org-123/year=2026/month=11/day=23/hour=10/conversation_id=another-conversation/recording-1_metadata.json',config)).toBeUndefined();
   });
 
+  it('supports an organization ID as the configured prefix and prioritizes Genesys mediaType over mediaSubtype',()=>{
+    const config=s3SourceSchema.parse({name:'Archive',bucket:'mfec-genesys-recordings',region:'ap-southeast-1',prefix:'org-123',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'});
+    const key='org-123/year=2026/month=11/day=23/hour=12/conversation_id=conv-1/recording-1.opus_metadata.json';
+    const metadata={organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',conversationStartTime:'2026-11-23T12:22:28.265+0000',durationMs:55020,initialDirection:'inbound',aniNormalized:'tel:+66636538939',dnisNormalized:'tel:+6625440862',userIds:['agent-1'],queueIds:['queue-1'],mediaType:'Call',mediaSubtype:'Trunk'};
+    const normalized=normalizeExportMetadata(metadata,key,{...config,accessKeyId:config.accessKeyId!,secretAccessKey:config.secretAccessKey!});
+    expect(normalized).toMatchObject({conversationId:'conv-1',conversationStart:'2026-11-23T12:22:28.265Z',direction:'inbound',ani:'tel:+66636538939',dnis:'tel:+6625440862',interactionType:'Call',mediaType:'audio',recordings:[{id:'recording-1',mediaType:'Call',hasMedia:true}]});
+  });
+
   it('discovers screen recordings without weakening voice verification or leaking media URIs',async()=>{
     const signed='https://media.usw2.pure.cloud/secure?token=never-expose',conversation={participants:[{sessions:[{mediaType:'voice'}]}]},client={async get<T>(){return [{id:'voice-1',media:'audio',mediaType:'voice',mediaUris:{WEBM:{mediaUri:signed}}},{id:'screen-1',mediaType:'screenRecording',mediaUris:{WEBM:{mediaUri:signed}}},{id:'chat-1',mediaType:'chat',mediaUris:{WEBM:{mediaUri:signed}}}] as T;}};
     const items=await listConversationRecordings(client,'conversation'),playable=listPlayableRecordings(items,conversation);
@@ -117,6 +125,19 @@ describe('MFEC Recording Explorer security and synthetic fixtures', () => {
     expect(result.results).toHaveLength(1);
     expect(result.results[0]).toMatchObject({conversationId:'conv-1',agents:['Nicha S.'],queues:['Customer Care']});
     expect(requests[0].Prefix).toBe('exports/org-123/year=2026/month=11/day=23/');
+  });
+
+  it('does not duplicate the organization ID when it is already the configured S3 prefix',async()=>{
+    const parsed=s3SourceSchema.parse({name:'Archive',bucket:'mfec-genesys-exports',region:'ap-southeast-1',prefix:'org-123',organizationId:'org-123',accessKeyId:'key',secretAccessKey:'secret'});
+    const config={...parsed,accessKeyId:parsed.accessKeyId!,secretAccessKey:parsed.secretAccessKey!};
+    const key='org-123/year=2026/month=11/day=23/hour=10/conversation_id=conv-1/recording-1.opus_metadata.json';
+    const metadata={organizationId:'org-123',conversationId:'conv-1',recordingId:'recording-1',conversationStartTime:'2026-11-23T10:14:00.000Z',durationMs:8250,initialDirection:'inbound',mediaType:'Call',mediaSubtype:'Trunk'};
+    const requests:any[]=[];
+    const client={send:async(command:any)=>{requests.push(command.input);if(command.constructor.name==='ListObjectsV2Command')return {Contents:[{Key:key,Size:JSON.stringify(metadata).length}]};if(command.constructor.name==='GetObjectCommand')return {Body:Readable.from([Buffer.from(JSON.stringify(metadata))])};throw new Error('Unexpected S3 command.');},destroy(){}};
+    const result=await searchS3Recordings(config,{start:'2026-11-23T00:00:00.000Z',end:'2026-11-24T00:00:00.000Z',pageNumber:1,pageSize:25},()=>client as any);
+    expect(requests[0].Prefix).toBe('org-123/year=2026/month=11/day=23/');
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]).toMatchObject({conversationId:'conv-1',direction:'inbound',recordings:[{id:'recording-1'}]});
   });
 
   it('retrieves only a requested AWS S3 audio byte range and reports range headers',async()=>{
